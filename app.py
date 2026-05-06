@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -423,6 +424,44 @@ if "theme" not in st.session_state:
     st.session_state.theme = "🌙 Dark"
 if st.session_state.theme == "☀️ Light":
     st.markdown(LIGHT_CSS_OVERRIDE, unsafe_allow_html=True)
+
+
+# ---------- Auth gate ----------
+
+def _auth_gate() -> None:
+    if st.session_state.get("authenticated"):
+        return
+    config = dm.load_config()
+    if not config.get("passwordHash"):
+        st.markdown("## 🔥 FIRE — First-time Setup")
+        st.markdown("Create a password to protect your data.")
+        pwd = st.text_input("New password", type="password")
+        confirm = st.text_input("Confirm password", type="password")
+        if st.button("Set password", type="primary"):
+            if not pwd:
+                st.error("Password cannot be empty.")
+            elif pwd != confirm:
+                st.error("Passwords do not match.")
+            else:
+                h = hashlib.sha256(pwd.encode()).hexdigest()
+                dm.save_config({"passwordHash": h})
+                st.session_state.authenticated = True
+                st.rerun()
+        st.stop()
+    else:
+        st.markdown("## 🔥 FIRE — Login")
+        pwd = st.text_input("Password", type="password")
+        if st.button("Login", type="primary"):
+            h = hashlib.sha256(pwd.encode()).hexdigest()
+            if h == config["passwordHash"]:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+        st.stop()
+
+
+_auth_gate()
 
 
 # ---------- Session bootstrap ----------

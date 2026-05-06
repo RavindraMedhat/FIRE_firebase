@@ -1,24 +1,32 @@
-"""CSV-backed data layer + ETF API fetching for the FIRE Python app."""
+"""Firestore-backed data layer + ETF API fetching for the FIRE Python app."""
 
 from __future__ import annotations
 
 import math
+import os
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import firebase_admin
+from firebase_admin import firestore
 import pandas as pd
 import requests
 
+# ── Firebase init (real Firestore) ───────────────────────────────────────────
+_KEY_FILE = Path(__file__).parent / "serviceAccountKey.json"
+
+if not firebase_admin._apps:
+    cred = firebase_admin.credentials.Certificate(str(_KEY_FILE))
+    firebase_admin.initialize_app(cred)
+
+db: firestore.Client = firestore.client()
+
+# ── ETF cache stays local ────────────────────────────────────────────────────
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
-
-USER_CSV = DATA_DIR / "user.csv"
-HOLDINGS_CSV = DATA_DIR / "holdings.csv"
-SELLS_CSV = DATA_DIR / "sells.csv"
-BUYS_CSV = DATA_DIR / "buys.csv"
 ETFS_CACHE_CSV = DATA_DIR / "etfs_cache.csv"
 
 API_URL = (
@@ -30,35 +38,26 @@ USER_COLUMNS = [
     "userName",
     "investment",
     "remainingAmount",
-    "taxPercentage",           # kept for back-compat; no longer user-editable
-    "brokeragePercentage",     # kept for back-compat; no longer user-editable
+    "taxPercentage",
+    "brokeragePercentage",
     "dividendPercentage",
     "sellProfitTarget",
     "buyInDipThreshold",
 ]
 
-
 # ---- Kotak Securities charges (Kotak Trade Plan, delivery, 2025) ----
-# Sources: PDF tariff sheet + standard Indian regulatory charges.
-
 KOTAK_RATES = {
-    # Equity ETFs and Gold/Jewellery ETFs → "other ETFs" bucket (0.05%)
     "Equity":    {"brokerage_pct": 0.05, "stt_buy_pct": 0.0,  "stt_sell_pct": 0.001},
     "Jewellery": {"brokerage_pct": 0.05, "stt_buy_pct": 0.0,  "stt_sell_pct": 0.001},
-    # Direct stock delivery (Cash segment)
     "Stocks":    {"brokerage_pct": 0.10, "stt_buy_pct": 0.1,  "stt_sell_pct": 0.1},
 }
-EXCHANGE_TX_PCT = 0.00297   # NSE equity cash
-SEBI_PCT = 0.0001           # ₹10 per crore
-STAMP_DUTY_PCT_BUY = 0.015  # on buy value only (all securities)
-GST_PCT = 18.0              # on (brokerage + exchange + SEBI)
+EXCHANGE_TX_PCT = 0.00297
+SEBI_PCT = 0.0001
+STAMP_DUTY_PCT_BUY = 0.015
+GST_PCT = 18.0
 
 
 def compute_kotak_charges(value: float, etf_type: str, side: str) -> dict:
-    """Return itemized charges for a single Kotak delivery trade.
-
-    side = 'buy' or 'sell'. All values are absolute rupees.
-    """
     rates = KOTAK_RATES.get(etf_type, KOTAK_RATES["Equity"])
     brokerage = value * rates["brokerage_pct"] / 100
     if side == "buy":
@@ -79,9 +78,9 @@ def compute_kotak_charges(value: float, etf_type: str, side: str) -> dict:
         "sebi": sebi,
         "gst": gst,
         "total": total,
-        # Aggregated legacy buckets (everything statutory except brokerage):
         "tax": stt + stamp + exchange_tx + sebi + gst,
     }
+
 
 HOLDING_COLUMNS = [
     "id",
@@ -115,7 +114,7 @@ BUY_COLUMNS = [
     "quantity",
     "price",
     "brokerageCharges",
-    "tax",          # stt + stamp + exchange + sebi + gst (bundled)
+    "tax",
     "totalCharges",
     "buyDate",
 ]
@@ -134,7 +133,60 @@ ETF_COLUMNS = [
 ]
 
 
-# ---------- User ----------
+# ── Firestore helpers ────────────────────────────────────────────────────────
+
+def _clean(v):
+    """Replace NaN/None with None so Firestore accepts it."""
+    if v is None:
+        return None
+    if isinstance(v, float) and math.isnan(v):
+        return None
+    return v
+
+
+def _clean_row(d: dict) -> dict:
+    return {k: _clean(v) for k, v in d.items()}
+
+
+def _collection_to_df(col_name: str, columns: list[str]) -> pd.DataFrame:
+    docs = db.collection(col_name).stream()
+    rows = [doc.to_dict() for doc in docs]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    df = pd.DataFrame(rows)
+    for col in columns:
+        if col not in df.columns:
+            df[col] = None
+    return df[columns]
+
+
+def _replace_collection(col_name: str, df: pd.DataFrame, id_field: str) -> None:
+    """Delete all existing docs then write every row in df."""
+    col_ref = db.collection(col_name)
+    existing = list(col_ref.stream())
+    batch = db.batch()
+    for doc in existing:
+        batch.delete(doc.reference)
+    for _, row in df.iterrows():
+        data = _clean_row(row.to_dict())
+        batch.set(col_ref.document(str(data[id_field])), data)
+    batch.commit()
+
+
+# ── Config (password) ────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    doc = db.collection("meta").document("config").get()
+    if not doc.exists:
+        return {}
+    return doc.to_dict() or {}
+
+
+def save_config(data: dict) -> None:
+    db.collection("meta").document("config").set(data, merge=True)
+
+
+# ── User ─────────────────────────────────────────────────────────────────────
 
 @dataclass
 class UserSettings:
@@ -149,14 +201,12 @@ class UserSettings:
 
 
 def load_user() -> UserSettings:
-    if not USER_CSV.exists():
+    doc = db.collection("meta").document("user").get()
+    if not doc.exists:
         u = UserSettings()
         save_user(u)
         return u
-    df = pd.read_csv(USER_CSV)
-    if df.empty:
-        return UserSettings()
-    row = df.iloc[0].to_dict()
+    row = doc.to_dict() or {}
     raw_name = row.get("userName", "")
     if raw_name is None or (isinstance(raw_name, float) and math.isnan(raw_name)):
         raw_name = ""
@@ -173,64 +223,41 @@ def load_user() -> UserSettings:
 
 
 def save_user(u: UserSettings) -> None:
-    df = pd.DataFrame([{col: getattr(u, col) for col in USER_COLUMNS}])
-    df.to_csv(USER_CSV, index=False)
+    data = {col: getattr(u, col) for col in USER_COLUMNS}
+    db.collection("meta").document("user").set(data)
 
 
-# ---------- Holdings ----------
+# ── Holdings ──────────────────────────────────────────────────────────────────
 
 def load_holdings() -> pd.DataFrame:
-    if not HOLDINGS_CSV.exists():
-        return pd.DataFrame(columns=HOLDING_COLUMNS)
-    df = pd.read_csv(HOLDINGS_CSV)
-    for col in HOLDING_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-    return df[HOLDING_COLUMNS]
+    return _collection_to_df("holdings", HOLDING_COLUMNS)
 
 
 def save_holdings(df: pd.DataFrame) -> None:
-    df[HOLDING_COLUMNS].to_csv(HOLDINGS_CSV, index=False)
+    _replace_collection("holdings", df[HOLDING_COLUMNS], "id")
 
 
-# ---------- Sells ----------
+# ── Sells ────────────────────────────────────────────────────────────────────
 
 def load_sells() -> pd.DataFrame:
-    if not SELLS_CSV.exists():
-        return pd.DataFrame(columns=SELL_COLUMNS)
-    df = pd.read_csv(SELLS_CSV)
-    for col in SELL_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-    return df[SELL_COLUMNS]
+    return _collection_to_df("sells", SELL_COLUMNS)
 
 
 def save_sells(df: pd.DataFrame) -> None:
-    df[SELL_COLUMNS].to_csv(SELLS_CSV, index=False)
+    _replace_collection("sells", df[SELL_COLUMNS], "id")
 
 
-# ---------- Buys (transaction log for reverse support) ----------
+# ── Buys ─────────────────────────────────────────────────────────────────────
 
 def load_buys() -> pd.DataFrame:
-    if not BUYS_CSV.exists():
-        return pd.DataFrame(columns=BUY_COLUMNS)
-    df = pd.read_csv(BUYS_CSV)
-    for col in BUY_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-    return df[BUY_COLUMNS]
+    return _collection_to_df("buys", BUY_COLUMNS)
 
 
 def save_buys(df: pd.DataFrame) -> None:
-    df[BUY_COLUMNS].to_csv(BUYS_CSV, index=False)
+    _replace_collection("buys", df[BUY_COLUMNS], "id")
 
 
 def backfill_buys_from_holdings() -> int:
-    """Create synthetic buy-log entries for any holding that has no matching record.
-
-    Ensures legacy holdings (made before buy-logging was added) show up on the
-    Transactions page with a reverse button. Returns the number of entries added.
-    """
     holdings = load_holdings()
     if holdings.empty:
         return 0
@@ -265,7 +292,7 @@ def backfill_buys_from_holdings() -> int:
     return len(new_rows)
 
 
-# ---------- ETFs ----------
+# ── ETFs (local CSV cache) ────────────────────────────────────────────────────
 
 def load_etfs_cache() -> pd.DataFrame:
     if not ETFS_CACHE_CSV.exists():
@@ -287,7 +314,6 @@ def _to_float(v) -> float:
 
 
 def fetch_etfs(timeout: int = 30) -> pd.DataFrame:
-    """Fetch ETF data from the live API and cache it. Mirrors the Flutter parsing."""
     resp = requests.get(API_URL, timeout=timeout)
     resp.raise_for_status()
     raw = resp.json()
@@ -326,7 +352,7 @@ def get_etfs(refresh: bool = False) -> pd.DataFrame:
     return load_etfs_cache()
 
 
-# ---------- Business logic ----------
+# ── Business logic ────────────────────────────────────────────────────────────
 
 def _now_iso() -> str:
     return datetime.now().isoformat()
@@ -355,7 +381,6 @@ def buy_etf(
     price: float,
     quantity: int,
 ) -> tuple[UserSettings, pd.DataFrame, dict]:
-    """Buy: updates holdings, deducts (value + Kotak charges) from remaining."""
     holdings = load_holdings()
     value = price * quantity
     charges = compute_kotak_charges(value, etf_type, side="buy")
@@ -387,7 +412,6 @@ def buy_etf(
 
     save_holdings(holdings)
 
-    # Log the buy so it can be reversed later.
     buys = load_buys()
     buy_row = {
         "id": str(uuid.uuid4()),
@@ -405,8 +429,6 @@ def buy_etf(
     save_buys(buys)
 
     user.remainingAmount = user.remainingAmount - value - charges["total"]
-    # Note: user.investment intentionally not changed on buy — it only moves on sell
-    # by realized net P/L. This matches the original Flutter behavior.
     save_user(user)
     return user, holdings, charges
 
@@ -418,7 +440,6 @@ def sell_holding(
     quantity: int,
     dividend: float,
 ) -> tuple[UserSettings, pd.DataFrame, pd.DataFrame, dict]:
-    """Sell: auto-computes Kotak charges, updates holding, appends sell record, updates user."""
     holdings = load_holdings()
     sells = load_sells()
 
@@ -439,7 +460,7 @@ def sell_holding(
     value = sell_price * quantity
     charges = compute_kotak_charges(value, etf_type, side="sell")
     brokerage = charges["brokerage"]
-    tax = charges["tax"]  # stt + stamp(=0) + exchange + sebi + gst
+    tax = charges["tax"]
 
     remaining_qty = old_qty - quantity
 
@@ -487,7 +508,6 @@ def generate_suggestions(
     etfs: pd.DataFrame,
     holdings: pd.DataFrame,
 ) -> list[dict]:
-    """Replicates Flutter SuggestionController.fetchSuggestions."""
     if etfs.empty:
         return []
 
@@ -505,7 +525,6 @@ def generate_suggestions(
         held = set(holdings["etfName"].astype(str).tolist())
         top = top[~top["name"].isin(held)]
 
-    # For each type, pick the single ETF with minimum change20DmaVsCmp.
     suggestions = []
     for etf_type, group in top.groupby("type"):
         if group.empty:
@@ -529,7 +548,6 @@ def classify_holdings(
     etfs: pd.DataFrame,
     user: UserSettings,
 ) -> dict:
-    """Split holdings into sell / buy / others based on CMP vs average price."""
     if holdings.empty:
         return {"sell": pd.DataFrame(), "buy": pd.DataFrame(), "others": pd.DataFrame()}
 
@@ -561,7 +579,6 @@ def classify_holdings(
 
 
 def reset_all_transactions(user: UserSettings) -> UserSettings:
-    """Wipe holdings, sells, buys. Restore remaining = investment. Keeps settings."""
     save_holdings(pd.DataFrame(columns=HOLDING_COLUMNS))
     save_sells(pd.DataFrame(columns=SELL_COLUMNS))
     save_buys(pd.DataFrame(columns=BUY_COLUMNS))
@@ -571,12 +588,6 @@ def reset_all_transactions(user: UserSettings) -> UserSettings:
 
 
 def delete_holding(user: UserSettings, holding_id: str) -> tuple[UserSettings, pd.DataFrame]:
-    """Remove a holding entirely and refund its estimated original cost.
-
-    Used for legacy holdings made before the buy-log existed, or any time you
-    want to wipe a holding without going through the log. Refund =
-    (avgPrice × qty) + estimated Kotak buy charges on that value.
-    """
     holdings = load_holdings()
     match = holdings[holdings["id"] == holding_id]
     if match.empty:
@@ -592,7 +603,6 @@ def delete_holding(user: UserSettings, holding_id: str) -> tuple[UserSettings, p
     holdings = holdings.drop(match.index).reset_index(drop=True)
     save_holdings(holdings)
 
-    # Also purge any matching buy-log rows for this holding
     buys = load_buys()
     if not buys.empty:
         buys = buys[buys["holdingId"] != holding_id].reset_index(drop=True)
@@ -604,7 +614,6 @@ def delete_holding(user: UserSettings, holding_id: str) -> tuple[UserSettings, p
 
 
 def reverse_buy(user: UserSettings, buy_id: str) -> tuple[UserSettings, pd.DataFrame, pd.DataFrame]:
-    """Undo a previously-recorded buy. Restores cash, adjusts avg price, drops holding if empty."""
     buys = load_buys()
     match = buys[buys["id"] == buy_id]
     if match.empty:
@@ -638,17 +647,14 @@ def reverse_buy(user: UserSettings, buy_id: str) -> tuple[UserSettings, pd.DataF
     if new_qty == 0:
         holdings = holdings.drop(idx).reset_index(drop=True)
     else:
-        # Reverse formula: cur_avg × cur_qty = new_avg × new_qty + price × qty_to_remove
         new_avg = (cur_avg * cur_qty - price * qty_to_remove) / new_qty
         holdings.at[idx, "averagePrice"] = new_avg
         holdings.at[idx, "totalQuantity"] = new_qty
     save_holdings(holdings)
 
-    # Remove the buy record from the log
     buys = buys.drop(match.index).reset_index(drop=True)
     save_buys(buys)
 
-    # Refund remaining (investment is not touched on buy, so no restore needed)
     user.remainingAmount = user.remainingAmount + value + total_charges
     save_user(user)
 
@@ -656,7 +662,6 @@ def reverse_buy(user: UserSettings, buy_id: str) -> tuple[UserSettings, pd.DataF
 
 
 def reverse_sell(user: UserSettings, sell_id: str) -> tuple[UserSettings, pd.DataFrame, pd.DataFrame]:
-    """Undo a previously-recorded sell. Restores the holding + debits cash."""
     sells = load_sells()
     match = sells[sells["id"] == sell_id]
     if match.empty:
@@ -679,7 +684,6 @@ def reverse_sell(user: UserSettings, sell_id: str) -> tuple[UserSettings, pd.Dat
     hmatch = holdings[holdings["etfName"] == etf_name]
 
     if hmatch.empty:
-        # Holding was fully sold → recreate it with the original avg price.
         new_row = {
             "id": str(uuid.uuid4()),
             "etfName": etf_name,
@@ -694,19 +698,14 @@ def reverse_sell(user: UserSettings, sell_id: str) -> tuple[UserSettings, pd.Dat
         idx = hmatch.index[0]
         cur_avg = float(holdings.at[idx, "averagePrice"])
         cur_qty = int(holdings.at[idx, "totalQuantity"])
-        # Reverse of sell's new_avg = (old_avg×old_qty - sell×sold_qty)/(old_qty-sold_qty)
         restored_avg = (cur_avg * cur_qty + sell_price * qty) / (cur_qty + qty)
         holdings.at[idx, "averagePrice"] = restored_avg
         holdings.at[idx, "totalQuantity"] = cur_qty + qty
     save_holdings(holdings)
 
-    # Remove the sell record
     sells = sells.drop(match.index).reset_index(drop=True)
     save_sells(sells)
 
-    # Reverse the user.csv changes that were made on sell:
-    #   remaining += (value - brokerage - dividend - tax)     → now subtract
-    #   investment += (qty × (sell-avg) - brokerage - dividend - tax)  → now subtract
     user.remainingAmount = (
         user.remainingAmount - value + brokerage + dividend + tax
     )
@@ -723,7 +722,6 @@ def reverse_sell(user: UserSettings, sell_id: str) -> tuple[UserSettings, pd.Dat
 
 
 def holdings_by_type(holdings: pd.DataFrame, etfs: pd.DataFrame) -> pd.DataFrame:
-    """Per-type breakdown: count, cost, currentValue, pnl, pnlPct. Empty df if no holdings."""
     if holdings.empty:
         return pd.DataFrame(columns=["etfType", "count", "cost", "currentValue", "pnl", "pnlPct"])
     merged = holdings.merge(
@@ -746,7 +744,6 @@ def holdings_by_type(holdings: pd.DataFrame, etfs: pd.DataFrame) -> pd.DataFrame
 
 
 def fees_by_type(sells: pd.DataFrame) -> pd.DataFrame:
-    """Per-type breakdown of realized sell-side fees + P/L. Empty df if no sells."""
     if sells.empty:
         return pd.DataFrame(
             columns=["etfType", "count", "brokerage", "tax", "dividend", "grossPL", "netPL"]
@@ -772,17 +769,11 @@ def fees_by_type(sells: pd.DataFrame) -> pd.DataFrame:
 def buyback_opportunities(
     sells: pd.DataFrame, etfs: pd.DataFrame, holdings: pd.DataFrame,
 ) -> list[dict]:
-    """ETFs you previously sold that are now cheaper than your sell price.
-
-    Returns the most-discounted one per ETF (based on CMP vs weighted-avg sell price).
-    Excludes ETFs you currently hold. Sorted by biggest discount first.
-    """
     if sells.empty or etfs.empty:
         return []
 
     held = set() if holdings.empty else set(holdings["etfName"].astype(str).tolist())
 
-    # Weighted-avg sell price per ETF
     df = sells.copy()
     df["quantity"] = df["quantity"].astype(float)
     df["sellPrice"] = df["sellPrice"].astype(float)
@@ -793,14 +784,13 @@ def buyback_opportunities(
     ).reset_index()
     agg["avgSellPrice"] = agg["valSold"] / agg["qtySold"]
 
-    # Join current CMP
     m = agg.merge(
         etfs[["name", "cmp"]], left_on="etfName", right_on="name", how="left"
     )
     m["cmp"] = m["cmp"].fillna(0).astype(float)
     m = m[(m["cmp"] > 0) & (~m["etfName"].isin(held))]
     m["discountPct"] = (m["avgSellPrice"] - m["cmp"]) / m["avgSellPrice"] * 100
-    m = m[m["discountPct"] > 0]  # only cheaper than sell
+    m = m[m["discountPct"] > 0]
     m = m.sort_values("discountPct", ascending=False)
 
     return [
@@ -810,7 +800,7 @@ def buyback_opportunities(
             "price": float(r["cmp"]),
             "avgSellPrice": float(r["avgSellPrice"]),
             "discountPct": float(r["discountPct"]),
-            "qty": 1,  # suggest buying 1 unit by default; user can adjust
+            "qty": 1,
         }
         for _, r in m.iterrows()
     ]
@@ -821,7 +811,6 @@ def compute_report(
     sells: pd.DataFrame,
     etfs: pd.DataFrame,
 ) -> dict:
-    """Aggregates the figures shown on the Reports page."""
     total_profit = 0.0
     total_growth = 0.0
     total_tax = 0.0
@@ -869,8 +858,6 @@ def compute_report(
     }
 
 
-# ---------- Money-flow / verification helpers ----------
-
 def compute_money_summary(
     user: "UserSettings",
     buys: pd.DataFrame,
@@ -878,21 +865,12 @@ def compute_money_summary(
     holdings: pd.DataFrame,
     etfs: pd.DataFrame,
 ) -> dict:
-    """End-to-end cash-flow snapshot so the user can verify every rupee.
-
-    Identity (always holds, modulo float rounding):
-        initialDeposit
-          + grossRealizedPL                      (extra rupees from profitable sells)
-          - buyFeesTotal - sellFeesTotal - dividendOut
-          = remainingCash + costBasis            (what the account holds today)
-    """
-    # ---- Buys ----
     buy_count = 0
-    buy_gross = 0.0          # Σ price·qty
+    buy_gross = 0.0
     buy_brokerage = 0.0
-    buy_tax = 0.0            # statutory bundle (stt + stamp + exch + sebi + gst)
-    buy_total_charges = 0.0  # brokerage + tax
-    buy_outflow = 0.0        # gross + charges  → what actually left cash on each buy
+    buy_tax = 0.0
+    buy_total_charges = 0.0
+    buy_outflow = 0.0
     if not buys.empty:
         b = buys.copy()
         q = b["quantity"].astype(float)
@@ -908,17 +886,16 @@ def compute_money_summary(
         buy_total_charges = float(tc.sum())
         buy_outflow = float((gross + tc).sum())
 
-    # ---- Sells ----
     sell_count = 0
-    sell_gross = 0.0           # Σ sellPrice·qty (cash that would arrive ignoring fees)
-    sell_cost_at_sale = 0.0    # Σ avgPrice·qty (cost basis released by sells)
+    sell_gross = 0.0
+    sell_cost_at_sale = 0.0
     sell_brokerage = 0.0
     sell_tax = 0.0
     sell_dividend = 0.0
-    sell_fees_total = 0.0      # brokerage + tax  (excl. dividend, which is a self-payment)
-    sell_inflow = 0.0          # gross − brokerage − tax − dividend → cash actually returned
-    sell_gross_pl = 0.0        # gross − cost_at_sale (extra cash from price rise)
-    sell_net_pl = 0.0          # gross_pl − brokerage − tax − dividend
+    sell_fees_total = 0.0
+    sell_inflow = 0.0
+    sell_gross_pl = 0.0
+    sell_net_pl = 0.0
     if not sells.empty:
         s = sells.copy()
         q = s["quantity"].astype(float)
@@ -940,7 +917,6 @@ def compute_money_summary(
         sell_gross_pl = float((gross - cost_at_sale).sum())
         sell_net_pl = float((gross - cost_at_sale - br - tx - dv).sum())
 
-    # ---- Holdings (currently deployed money) ----
     cost_basis = 0.0
     current_value = 0.0
     if not holdings.empty:
@@ -957,38 +933,30 @@ def compute_money_summary(
 
     unrealized_pl = current_value - cost_basis
 
-    # ---- Capital reconciliation ----
-    # user.investment grows by net realized P/L on each sell, so initial deposit =
-    # current investment − cumulative net realized P/L.
     current_investment = float(user.investment)
     initial_deposit = current_investment - sell_net_pl
     remaining_cash = float(user.remainingAmount)
 
-    fees_paid_total = buy_total_charges + sell_fees_total      # money truly lost to charges
-    money_consumed = fees_paid_total + sell_dividend           # outflows (incl. self-paid div)
+    fees_paid_total = buy_total_charges + sell_fees_total
+    money_consumed = fees_paid_total + sell_dividend
 
-    # Account balance available now (cash + cost basis of open positions):
     account_balance = remaining_cash + cost_basis
-    # What that balance *should* equal, derived from external flows + realized PL:
     expected_balance = initial_deposit + sell_gross_pl - money_consumed
     diff = account_balance - expected_balance
 
     return {
-        # capital
         "initialDeposit": initial_deposit,
         "currentInvestment": current_investment,
         "remainingCash": remaining_cash,
         "costBasis": cost_basis,
         "currentValue": current_value,
         "unrealizedPL": unrealized_pl,
-        # buys
         "buyCount": buy_count,
         "buyGross": buy_gross,
         "buyBrokerage": buy_brokerage,
         "buyTax": buy_tax,
         "buyTotalCharges": buy_total_charges,
         "buyOutflow": buy_outflow,
-        # sells
         "sellCount": sell_count,
         "sellGross": sell_gross,
         "sellCostAtSale": sell_cost_at_sale,
@@ -999,10 +967,8 @@ def compute_money_summary(
         "sellInflow": sell_inflow,
         "sellGrossPL": sell_gross_pl,
         "sellNetPL": sell_net_pl,
-        # combined
         "feesPaidTotal": fees_paid_total,
         "moneyConsumed": money_consumed,
-        # reconciliation
         "accountBalance": account_balance,
         "expectedBalance": expected_balance,
         "reconcileDiff": diff,
@@ -1015,13 +981,6 @@ def money_by_etf(
     holdings: pd.DataFrame,
     etfs: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Per-ETF money usage: bought, sold, currently held, fees, P/L.
-
-    Columns: etfName, etfType, buyQty, buyValue, buyFees, buyOutflow,
-             sellQty, sellGross, sellFees, sellInflow, sellNetPL,
-             heldQty, costBasis, currentValue, unrealizedPL, netInvested
-    where netInvested = buyOutflow − sellInflow (cash actually tied up in this name).
-    """
     rows: dict[str, dict] = {}
 
     def _row(name: str, etf_type: str) -> dict:
@@ -1090,10 +1049,6 @@ def money_by_etf(
 
 
 def money_by_month(buys: pd.DataFrame, sells: pd.DataFrame) -> pd.DataFrame:
-    """Month-wise cash flow — buy outflow vs sell inflow vs fees.
-
-    Columns: month, buyOutflow, buyFees, sellInflow, sellFees, dividend, netCashFlow
-    """
     parts = []
     if not buys.empty:
         b = buys.copy()

@@ -12,3 +12,6 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# Firebase — never commit the private key
+serviceAccountKey.json
