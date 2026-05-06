@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import math
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -19,6 +22,11 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Cookie manager — must be instantiated right after set_page_config
+_cookie_mgr = stx.CookieManager(key="fire_v1")
+_SESSION_COOKIE = "fire_session"
+_SESSION_HOURS = 7
 
 
 # ---------- Styling ----------
@@ -428,11 +436,51 @@ if st.session_state.theme == "☀️ Light":
 
 # ---------- Auth gate ----------
 
+def _make_session_token(password_hash: str) -> str:
+    """Create a signed token that expires in SESSION_HOURS."""
+    expiry = int(time.time()) + _SESSION_HOURS * 3600
+    sig = hmac.new(password_hash.encode(), str(expiry).encode(), hashlib.sha256).hexdigest()
+    return f"{expiry}:{sig}"
+
+
+def _verify_session_token(token: str, password_hash: str) -> bool:
+    """Return True if token is valid and not expired."""
+    try:
+        expiry_str, sig = token.split(":", 1)
+        if time.time() > int(expiry_str):
+            return False
+        expected = hmac.new(password_hash.encode(), expiry_str.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected)
+    except Exception:
+        return False
+
+
+def _set_session_cookie(password_hash: str) -> None:
+    token = _make_session_token(password_hash)
+    _cookie_mgr.set(
+        _SESSION_COOKIE,
+        token,
+        expires_at=datetime.now() + timedelta(hours=_SESSION_HOURS),
+    )
+
+
 def _auth_gate() -> None:
+    # Already authenticated this session — fast path
     if st.session_state.get("authenticated"):
         return
+
     config = dm.load_config()
-    if not config.get("passwordHash"):
+    password_hash = config.get("passwordHash", "")
+
+    # Check for a valid session cookie (persists across refreshes for 7h)
+    if password_hash:
+        token = _cookie_mgr.get(_SESSION_COOKIE)
+        if token and _verify_session_token(token, password_hash):
+            st.session_state.authenticated = True
+            return
+
+    # First-time setup — no password set yet
+    if not password_hash:
         st.markdown("## 🔥 FIRE — First-time Setup")
         st.markdown("Create a password to protect your data.")
         pwd = st.text_input("New password", type="password")
@@ -446,19 +494,22 @@ def _auth_gate() -> None:
                 h = hashlib.sha256(pwd.encode()).hexdigest()
                 dm.save_config({"passwordHash": h})
                 st.session_state.authenticated = True
+                _set_session_cookie(h)
                 st.rerun()
         st.stop()
-    else:
-        st.markdown("## 🔥 FIRE — Login")
-        pwd = st.text_input("Password", type="password")
-        if st.button("Login", type="primary"):
-            h = hashlib.sha256(pwd.encode()).hexdigest()
-            if h == config["passwordHash"]:
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("Incorrect password.")
-        st.stop()
+
+    # Login screen
+    st.markdown("## 🔥 FIRE — Login")
+    pwd = st.text_input("Password", type="password")
+    if st.button("Login", type="primary"):
+        h = hashlib.sha256(pwd.encode()).hexdigest()
+        if h == password_hash:
+            st.session_state.authenticated = True
+            _set_session_cookie(h)
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
 
 
 _auth_gate()
