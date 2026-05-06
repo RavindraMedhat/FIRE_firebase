@@ -1,8 +1,14 @@
 # 🔥 FIRE — Financial Independence Investment Tracker
 
 A personal ETF/stock investment tracker built with Python + Streamlit.  
-Tracks holdings, buys, sells, P&L, charges (Kotak Securities), and suggestions.  
-Backend: **Firebase Firestore** (cloud database — data visible at console.firebase.google.com).
+Tracks holdings, buys, sells, P&L, charges (Kotak Securities), and suggestions.
+
+Supports **two backends** — switch with one env variable, no code changes needed:
+
+| Backend | Where data lives | When to use |
+|---------|-----------------|-------------|
+| `firebase` *(default)* | Firebase Firestore cloud | Deployment, multi-device |
+| `csv` | Local CSV files in `./data/` | Offline, no internet, quick local use |
 
 ---
 
@@ -10,25 +16,30 @@ Backend: **Firebase Firestore** (cloud database — data visible at console.fire
 
 ```
 FIRE/
-├── app.py                    # Streamlit UI (all pages)
-├── data_manager.py           # All Firebase read/write + business logic
-├── migrate_to_firebase.py    # One-shot: CSV → Firebase import
-├── export_from_firebase.py   # Anytime: Firebase → CSV backup
+├── app.py                      # Streamlit UI (all pages)
+├── data_manager.py             # Backend selector + all business logic
+├── models.py                   # Shared types: UserSettings, column schemas
+├── backends/
+│   ├── csv_backend.py          # CSV I/O (reads/writes ./data/*.csv)
+│   └── firebase_backend.py     # Firestore I/O (reads/writes Firebase)
+├── migrate_to_firebase.py      # One-shot: CSV → Firebase import
+├── export_from_firebase.py     # Anytime: Firebase → CSV backup
 ├── requirements.txt
-├── firebase.json             # Firebase project config
-├── .firebaserc               # Binds to project myfire-1783b
-├── firestore.rules           # Firestore security rules
-├── firestore.indexes.json    # Firestore indexes
-├── serviceAccountKey.json    # ⚠️  LOCAL ONLY — never committed
+├── firebase.json               # Firebase project config
+├── .firebaserc                 # Binds to project myfire-1783b
+├── firestore.rules             # Firestore security rules
+├── firestore.indexes.json      # Firestore indexes
+├── serviceAccountKey.json      # ⚠️  LOCAL ONLY — never committed
 ├── .streamlit/
-│   ├── config.toml           # Streamlit theme config
-│   └── secrets.toml          # ⚠️  LOCAL ONLY — never committed
+│   ├── config.toml             # Streamlit theme config
+│   └── secrets.toml            # ⚠️  LOCAL ONLY — never committed
 └── data/
-    ├── etfs_cache.csv        # Cached ETF prices (local, auto-refreshed)
-    ├── holdings.csv          # Exported backup only
-    ├── buys.csv              # Exported backup only
-    ├── sells.csv             # Exported backup only
-    └── user.csv              # Exported backup only
+    ├── etfs_cache.csv          # ETF price cache (always local, auto-refreshed)
+    ├── config.json             # ⚠️  LOCAL ONLY — password hash (CSV mode only)
+    ├── holdings.csv            # Used by CSV backend / export snapshots
+    ├── buys.csv                # Used by CSV backend / export snapshots
+    ├── sells.csv               # Used by CSV backend / export snapshots
+    └── user.csv                # Used by CSV backend / export snapshots
 ```
 
 ---
@@ -50,6 +61,30 @@ FIRE/
 
 ---
 
+## Switching Backends
+
+### Run with Firebase (default)
+
+```bash
+streamlit run app.py
+```
+
+### Run with CSV files
+
+```bash
+FIRE_BACKEND=csv streamlit run app.py
+```
+
+### On Streamlit Cloud — add one line to Secrets
+
+```toml
+FIRE_BACKEND = "csv"    # omit this line (or set "firebase") for Firebase
+```
+
+> `data_manager.py` checks the `FIRE_BACKEND` env var first, then `st.secrets`, then defaults to `firebase`.
+
+---
+
 ## Local Development Setup
 
 ### 1. Clone the repo
@@ -66,24 +101,35 @@ git checkout feature/firebase-firestore
 pip install -r requirements.txt
 ```
 
-### 3. Add Firebase credentials
+### 3a. Firebase backend — add credentials
 
 - Go to [Firebase Console](https://console.firebase.google.com) → project `myfire-1783b`
 - **Gear icon → Project settings → Service accounts → Generate new private key**
 - Save the downloaded file as `serviceAccountKey.json` in the project root
 
-> The file is gitignored — it will never be committed.
+> Gitignored — will never be committed.
+
+### 3b. CSV backend — no credentials needed
+
+Just run with `FIRE_BACKEND=csv`. Data is saved to `./data/*.csv` automatically.
 
 ### 4. Run the app
 
 ```bash
+# Firebase
 streamlit run app.py
+
+# CSV
+FIRE_BACKEND=csv streamlit run app.py
 ```
 
 Opens at http://localhost:8501
 
 **First time:** you will be asked to create a password.  
 **Every session after:** login screen appears before the app loads.
+
+> Password is stored in Firebase (`meta/config`) for the Firebase backend,  
+> and in `data/config.json` (gitignored) for the CSV backend.
 
 ---
 
@@ -169,13 +215,45 @@ git push firebase feature/firebase-firestore
 
 ---
 
+## Backend Architecture
+
+```
+data_manager.py
+│
+│  reads FIRE_BACKEND env var / Streamlit secret
+│
+├── FIRE_BACKEND=csv      → backends/csv_backend.py
+│                              load_user / save_user
+│                              load_holdings / save_holdings
+│                              load_buys / save_buys
+│                              load_sells / save_sells
+│                              load_config / save_config  (data/config.json)
+│
+└── FIRE_BACKEND=firebase → backends/firebase_backend.py
+                               load_user / save_user
+                               load_holdings / save_holdings
+                               load_buys / save_buys
+                               load_sells / save_sells
+                               load_config / save_config  (Firestore meta/config)
+```
+
+Both backends expose the **exact same function signatures** — `data_manager.py`
+and `app.py` never know which one is active.
+
+`models.py` holds the shared `UserSettings` dataclass and column lists imported
+by both backends.
+
+ETF price cache (`data/etfs_cache.csv`) is **always local** regardless of backend.
+
+---
+
 ## Security — What is gitignored
 
 | File | Why |
 |------|-----|
 | `serviceAccountKey.json` | Firebase private key — never commit |
 | `.streamlit/secrets.toml` | Contains the same key in TOML format |
-| `firebase-data/` | Local emulator data (no longer used) |
+| `data/config.json` | Password hash for CSV backend — keep local |
 | `data set/` | Personal watchlist spreadsheets |
 | `fire_mobile/` | Old mobile version |
 | `fire full/` | Old Flutter version |
