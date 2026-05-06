@@ -9,7 +9,6 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -23,9 +22,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Cookie manager — must be instantiated right after set_page_config
-_cookie_mgr = stx.CookieManager(key="fire_v1")
-_SESSION_COOKIE = "fire_session"
+_SESSION_PARAM = "s"   # URL query-param key for the session token
 _SESSION_HOURS = 7
 
 
@@ -455,13 +452,8 @@ def _verify_session_token(token: str, password_hash: str) -> bool:
         return False
 
 
-def _set_session_cookie(password_hash: str) -> None:
-    token = _make_session_token(password_hash)
-    _cookie_mgr.set(
-        _SESSION_COOKIE,
-        token,
-        expires_at=datetime.now() + timedelta(hours=_SESSION_HOURS),
-    )
+def _set_session_token(password_hash: str) -> None:
+    st.query_params[_SESSION_PARAM] = _make_session_token(password_hash)
 
 
 def _auth_gate() -> None:
@@ -472,9 +464,10 @@ def _auth_gate() -> None:
     config = dm.load_config()
     password_hash = config.get("passwordHash", "")
 
-    # Check for a valid session cookie (persists across refreshes for 7h)
+    # Session token lives in the URL query param — available instantly on every
+    # render (no browser round-trip like cookies), so refresh works reliably.
     if password_hash:
-        token = _cookie_mgr.get(_SESSION_COOKIE)
+        token = st.query_params.get(_SESSION_PARAM, "")
         if token and _verify_session_token(token, password_hash):
             st.session_state.authenticated = True
             return
@@ -494,7 +487,7 @@ def _auth_gate() -> None:
                 h = hashlib.sha256(pwd.encode()).hexdigest()
                 dm.save_config({"passwordHash": h})
                 st.session_state.authenticated = True
-                _set_session_cookie(h)
+                _set_session_token(h)
                 st.rerun()
         st.stop()
 
@@ -505,7 +498,7 @@ def _auth_gate() -> None:
         h = hashlib.sha256(pwd.encode()).hexdigest()
         if h == password_hash:
             st.session_state.authenticated = True
-            _set_session_cookie(h)
+            _set_session_token(h)
             st.rerun()
         else:
             st.error("Incorrect password.")
@@ -1032,6 +1025,10 @@ def _buy_dialog(name: str, etf_type: str, price: float, qty: int) -> None:
 
     c1, c2 = st.columns(2)
     if c1.button("✅ Yes, buy it", type="primary", use_container_width=True, key="dlg_buy_yes"):
+        _guard = f"_op_done_buy_{name}_{price}_{qty}"
+        if st.session_state.get(_guard):
+            return  # already processing — drop the duplicate click
+        st.session_state[_guard] = True
         try:
             updated_user, _, _ = dm.buy_etf(
                 user=st.session_state.user,
@@ -1045,6 +1042,7 @@ def _buy_dialog(name: str, etf_type: str, price: float, qty: int) -> None:
             st.toast(f"🛒 Bought {qty} × {name} — total {fmt_money(total_cost)}", icon="✅")
             st.rerun()
         except Exception as exc:
+            del st.session_state[_guard]
             st.error(str(exc))
     if c2.button("❌ Cancel", use_container_width=True, key="dlg_buy_no"):
         st.rerun()
@@ -1078,6 +1076,10 @@ def _sell_dialog(holding_id: str, name: str, etf_type: str, sell_price: float, q
 
     c1, c2 = st.columns(2)
     if c1.button("✅ Yes, sell it", type="primary", use_container_width=True, key="dlg_sell_yes"):
+        _guard = f"_op_done_sell_{holding_id}_{sell_price}_{qty}"
+        if st.session_state.get(_guard):
+            return
+        st.session_state[_guard] = True
         try:
             updated_user, _, _, _ = dm.sell_holding(
                 user=st.session_state.user,
@@ -1092,6 +1094,7 @@ def _sell_dialog(holding_id: str, name: str, etf_type: str, sell_price: float, q
             st.toast(f"💰 Sold {qty} × {name} — net {fmt_money(net)}", icon="✅")
             st.rerun()
         except Exception as exc:
+            del st.session_state[_guard]
             st.error(str(exc))
     if c2.button("❌ Cancel", use_container_width=True, key="dlg_sell_no"):
         st.rerun()
@@ -1112,6 +1115,10 @@ def _delete_dialog(holding_id: str, name: str, etf_type: str, avg_price: float, 
 
     c1, c2 = st.columns(2)
     if c1.button("🗑️ Yes, delete it", type="primary", use_container_width=True, key="dlg_del_yes"):
+        _guard = f"_op_done_del_{holding_id}"
+        if st.session_state.get(_guard):
+            return
+        st.session_state[_guard] = True
         try:
             updated_user, _ = dm.delete_holding(st.session_state.user, holding_id)
             st.session_state.user = updated_user
@@ -1121,6 +1128,7 @@ def _delete_dialog(holding_id: str, name: str, etf_type: str, avg_price: float, 
             st.toast(f"🗑️ Deleted {name} — refunded {fmt_money(refund)}", icon="✅")
             st.rerun()
         except Exception as exc:
+            del st.session_state[_guard]
             st.error(str(exc))
     if c2.button("❌ Cancel", use_container_width=True, key="dlg_del_no"):
         st.rerun()
