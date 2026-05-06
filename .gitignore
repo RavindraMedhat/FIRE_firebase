@@ -16,3 +16,6 @@ __pycache__/
 # Firebase — never commit credentials
 serviceAccountKey.json
 .streamlit/secrets.toml
+
+# CSV backend — password hash stored locally
+data/config.json

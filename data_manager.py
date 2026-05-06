@@ -1,47 +1,71 @@
-"""Firestore-backed data layer + ETF API fetching for the FIRE Python app."""
+"""Data layer + ETF API fetching for the FIRE Python app.
+
+Backend is selected via the FIRE_BACKEND environment variable:
+  FIRE_BACKEND=firebase   →  Firebase Firestore (default)
+  FIRE_BACKEND=csv        →  local CSV files in ./data/
+"""
 
 from __future__ import annotations
 
 import math
 import os
 import uuid
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import firebase_admin
-from firebase_admin import firestore
+
 import pandas as pd
 import requests
 
-# ── Firebase init ────────────────────────────────────────────────────────────
-_KEY_FILE = Path(__file__).parent / "serviceAccountKey.json"
+from models import (
+    DATA_DIR,
+    UserSettings,
+    USER_COLUMNS,
+    HOLDING_COLUMNS,
+    SELL_COLUMNS,
+    BUY_COLUMNS,
+    ETF_COLUMNS,
+)
 
+# ── Backend selector ──────────────────────────────────────────────────────────
+# Change this one variable (or set the env var) to switch between backends.
+#
+#   FIRE_BACKEND=csv        streamlit run app.py   ← local CSV files
+#   FIRE_BACKEND=firebase   streamlit run app.py   ← Firebase Firestore (default)
 
-def _firebase_credential():
-    # Local development: use the JSON key file
-    if _KEY_FILE.exists():
-        return firebase_admin.credentials.Certificate(str(_KEY_FILE))
-    # Streamlit Cloud: credentials stored in st.secrets["gcp_service_account"]
+def _detect_backend() -> str:
+    value = os.getenv("FIRE_BACKEND", "").lower()
+    if value:
+        return value
     try:
         import streamlit as st
-        return firebase_admin.credentials.Certificate(dict(st.secrets["gcp_service_account"]))
+        return str(st.secrets.get("FIRE_BACKEND", "firebase")).lower()
     except Exception:
-        raise FileNotFoundError(
-            "Firebase credentials not found. "
-            "Add serviceAccountKey.json locally or configure Streamlit secrets."
-        )
+        return "firebase"
 
+_BACKEND = _detect_backend()
 
-if not firebase_admin._apps:
-    firebase_admin.initialize_app(_firebase_credential())
+if _BACKEND == "csv":
+    from backends.csv_backend import (
+        load_user, save_user,
+        load_holdings, save_holdings,
+        load_sells, save_sells,
+        load_buys, save_buys,
+        load_config, save_config,
+    )
+elif _BACKEND == "firebase":
+    from backends.firebase_backend import (
+        load_user, save_user,
+        load_holdings, save_holdings,
+        load_sells, save_sells,
+        load_buys, save_buys,
+        load_config, save_config,
+    )
+else:
+    raise ValueError(f"Unknown FIRE_BACKEND={_BACKEND!r}. Use 'csv' or 'firebase'.")
 
-db: firestore.Client = firestore.client()
-
-# ── ETF cache stays local ────────────────────────────────────────────────────
-DATA_DIR = Path(__file__).parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
+# ── ETF cache is always local ─────────────────────────────────────────────────
 ETFS_CACHE_CSV = DATA_DIR / "etfs_cache.csv"
 
 API_URL = (
@@ -49,18 +73,7 @@ API_URL = (
     "AKfycbzziniyDaACjDKiFLcTMepDdEtfswFtbGVWbYJnwJrPOhgO4z5WKfKosiPZwNcYxbI/exec"
 )
 
-USER_COLUMNS = [
-    "userName",
-    "investment",
-    "remainingAmount",
-    "taxPercentage",
-    "brokeragePercentage",
-    "dividendPercentage",
-    "sellProfitTarget",
-    "buyInDipThreshold",
-]
-
-# ---- Kotak Securities charges (Kotak Trade Plan, delivery, 2025) ----
+# ── Kotak Securities charges (Kotak Trade Plan, delivery, 2025) ───────────────
 KOTAK_RATES = {
     "Equity":    {"brokerage_pct": 0.05, "stt_buy_pct": 0.0,  "stt_sell_pct": 0.001},
     "Jewellery": {"brokerage_pct": 0.05, "stt_buy_pct": 0.0,  "stt_sell_pct": 0.001},
@@ -95,181 +108,6 @@ def compute_kotak_charges(value: float, etf_type: str, side: str) -> dict:
         "total": total,
         "tax": stt + stamp + exchange_tx + sebi + gst,
     }
-
-
-HOLDING_COLUMNS = [
-    "id",
-    "etfName",
-    "etfType",
-    "averagePrice",
-    "lastPurchasePrice",
-    "totalQuantity",
-    "lastPurchaseDate",
-]
-
-SELL_COLUMNS = [
-    "id",
-    "etfName",
-    "etfType",
-    "quantity",
-    "averagePurchasePrice",
-    "sellPrice",
-    "brokerageCharges",
-    "tax",
-    "dividendPaidToSelf",
-    "lastPurchaseDate",
-    "sellDate",
-]
-
-BUY_COLUMNS = [
-    "id",
-    "holdingId",
-    "etfName",
-    "etfType",
-    "quantity",
-    "price",
-    "brokerageCharges",
-    "tax",
-    "totalCharges",
-    "buyDate",
-]
-
-ETF_COLUMNS = [
-    "etfCode",
-    "name",
-    "cmp",
-    "the20Dma",
-    "change20DmaVsCmp",
-    "changePercentage",
-    "dailyAverageVolumeInLast30Days",
-    "dailyAverageVolumeInLast90Days",
-    "dailyAverageVolumeInLast365Days",
-    "type",
-]
-
-
-# ── Firestore helpers ────────────────────────────────────────────────────────
-
-def _clean(v):
-    """Replace NaN/None with None so Firestore accepts it."""
-    if v is None:
-        return None
-    if isinstance(v, float) and math.isnan(v):
-        return None
-    return v
-
-
-def _clean_row(d: dict) -> dict:
-    return {k: _clean(v) for k, v in d.items()}
-
-
-def _collection_to_df(col_name: str, columns: list[str]) -> pd.DataFrame:
-    docs = db.collection(col_name).stream()
-    rows = [doc.to_dict() for doc in docs]
-    if not rows:
-        return pd.DataFrame(columns=columns)
-    df = pd.DataFrame(rows)
-    for col in columns:
-        if col not in df.columns:
-            df[col] = None
-    return df[columns]
-
-
-def _replace_collection(col_name: str, df: pd.DataFrame, id_field: str) -> None:
-    """Delete all existing docs then write every row in df."""
-    col_ref = db.collection(col_name)
-    existing = list(col_ref.stream())
-    batch = db.batch()
-    for doc in existing:
-        batch.delete(doc.reference)
-    for _, row in df.iterrows():
-        data = _clean_row(row.to_dict())
-        batch.set(col_ref.document(str(data[id_field])), data)
-    batch.commit()
-
-
-# ── Config (password) ────────────────────────────────────────────────────────
-
-def load_config() -> dict:
-    doc = db.collection("meta").document("config").get()
-    if not doc.exists:
-        return {}
-    return doc.to_dict() or {}
-
-
-def save_config(data: dict) -> None:
-    db.collection("meta").document("config").set(data, merge=True)
-
-
-# ── User ─────────────────────────────────────────────────────────────────────
-
-@dataclass
-class UserSettings:
-    userName: str = ""
-    investment: float = 0.0
-    remainingAmount: float = 0.0
-    taxPercentage: float = 0.0
-    brokeragePercentage: float = 0.0
-    dividendPercentage: float = 0.0
-    sellProfitTarget: float = 3.0
-    buyInDipThreshold: float = 2.5
-
-
-def load_user() -> UserSettings:
-    doc = db.collection("meta").document("user").get()
-    if not doc.exists:
-        u = UserSettings()
-        save_user(u)
-        return u
-    row = doc.to_dict() or {}
-    raw_name = row.get("userName", "")
-    if raw_name is None or (isinstance(raw_name, float) and math.isnan(raw_name)):
-        raw_name = ""
-    return UserSettings(
-        userName=str(raw_name),
-        investment=float(row.get("investment", 0) or 0),
-        remainingAmount=float(row.get("remainingAmount", 0) or 0),
-        taxPercentage=float(row.get("taxPercentage", 0) or 0),
-        brokeragePercentage=float(row.get("brokeragePercentage", 0) or 0),
-        dividendPercentage=float(row.get("dividendPercentage", 0) or 0),
-        sellProfitTarget=float(row.get("sellProfitTarget", 3) or 3),
-        buyInDipThreshold=float(row.get("buyInDipThreshold", 2.5) or 2.5),
-    )
-
-
-def save_user(u: UserSettings) -> None:
-    data = {col: getattr(u, col) for col in USER_COLUMNS}
-    db.collection("meta").document("user").set(data)
-
-
-# ── Holdings ──────────────────────────────────────────────────────────────────
-
-def load_holdings() -> pd.DataFrame:
-    return _collection_to_df("holdings", HOLDING_COLUMNS)
-
-
-def save_holdings(df: pd.DataFrame) -> None:
-    _replace_collection("holdings", df[HOLDING_COLUMNS], "id")
-
-
-# ── Sells ────────────────────────────────────────────────────────────────────
-
-def load_sells() -> pd.DataFrame:
-    return _collection_to_df("sells", SELL_COLUMNS)
-
-
-def save_sells(df: pd.DataFrame) -> None:
-    _replace_collection("sells", df[SELL_COLUMNS], "id")
-
-
-# ── Buys ─────────────────────────────────────────────────────────────────────
-
-def load_buys() -> pd.DataFrame:
-    return _collection_to_df("buys", BUY_COLUMNS)
-
-
-def save_buys(df: pd.DataFrame) -> None:
-    _replace_collection("buys", df[BUY_COLUMNS], "id")
 
 
 def backfill_buys_from_holdings() -> int:
