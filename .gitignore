@@ -13,5 +13,6 @@ __pycache__/
 .vscode/
 .idea/
 
-# Firebase — never commit the private key
+# Firebase — never commit credentials
 serviceAccountKey.json
+.streamlit/secrets.toml

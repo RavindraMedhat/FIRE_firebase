@@ -15,12 +15,27 @@ from firebase_admin import firestore
 import pandas as pd
 import requests
 
-# ── Firebase init (real Firestore) ───────────────────────────────────────────
+# ── Firebase init ────────────────────────────────────────────────────────────
 _KEY_FILE = Path(__file__).parent / "serviceAccountKey.json"
 
+
+def _firebase_credential():
+    # Local development: use the JSON key file
+    if _KEY_FILE.exists():
+        return firebase_admin.credentials.Certificate(str(_KEY_FILE))
+    # Streamlit Cloud: credentials stored in st.secrets["gcp_service_account"]
+    try:
+        import streamlit as st
+        return firebase_admin.credentials.Certificate(dict(st.secrets["gcp_service_account"]))
+    except Exception:
+        raise FileNotFoundError(
+            "Firebase credentials not found. "
+            "Add serviceAccountKey.json locally or configure Streamlit secrets."
+        )
+
+
 if not firebase_admin._apps:
-    cred = firebase_admin.credentials.Certificate(str(_KEY_FILE))
-    firebase_admin.initialize_app(cred)
+    firebase_admin.initialize_app(_firebase_credential())
 
 db: firestore.Client = firestore.client()
 
