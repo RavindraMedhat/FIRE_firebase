@@ -1,0 +1,14 @@
+# Personal portfolio data — keep local only
+data set/
+fire_mobile/
+fire full/
+.venv/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
