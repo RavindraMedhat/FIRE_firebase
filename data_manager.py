@@ -498,8 +498,8 @@ def sell_holding(
     if remaining_qty == 0:
         holdings = holdings.drop(idx).reset_index(drop=True)
     else:
-        new_avg = (old_avg * old_qty - sell_price * quantity) / remaining_qty
-        holdings.at[idx, "averagePrice"] = new_avg
+        # Average purchase price is unchanged when selling — only quantity reduces
+        holdings.at[idx, "averagePrice"] = old_avg
         holdings.at[idx, "totalQuantity"] = remaining_qty
     save_holdings(holdings)
 
@@ -713,7 +713,7 @@ def reverse_sell(user: UserSettings, sell_id: str) -> tuple[UserSettings, pd.Dat
         idx = hmatch.index[0]
         cur_avg = float(holdings.at[idx, "averagePrice"])
         cur_qty = int(holdings.at[idx, "totalQuantity"])
-        restored_avg = (cur_avg * cur_qty + sell_price * qty) / (cur_qty + qty)
+        restored_avg = (cur_avg * cur_qty + original_avg * qty) / (cur_qty + qty)
         holdings.at[idx, "averagePrice"] = restored_avg
         holdings.at[idx, "totalQuantity"] = cur_qty + qty
     save_holdings(holdings)

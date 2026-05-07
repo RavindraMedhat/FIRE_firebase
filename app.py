@@ -462,6 +462,12 @@ def _auth_gate() -> None:
         return
 
     config = dm.load_config()
+
+    # Password protection disabled — let anyone in
+    if not config.get("passwordEnabled", True):
+        st.session_state.authenticated = True
+        return
+
     password_hash = config.get("passwordHash", "")
 
     # Session token lives in the URL query param — available instantly on every
@@ -485,7 +491,7 @@ def _auth_gate() -> None:
                 st.error("Passwords do not match.")
             else:
                 h = hashlib.sha256(pwd.encode()).hexdigest()
-                dm.save_config({"passwordHash": h})
+                dm.save_config({"passwordHash": h, "passwordEnabled": True})
                 st.session_state.authenticated = True
                 _set_session_token(h)
                 st.rerun()
@@ -1877,6 +1883,143 @@ def page_settings() -> None:
             st.session_state.user = u
             st.toast("💾 Settings saved", icon="✅")
             st.rerun()
+
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+
+    section("Deposit / Withdraw")
+    tab_dep, tab_wd = st.tabs(["➕ Deposit", "➖ Withdraw"])
+
+    # Reset flags are set on successful submit, applied on the NEXT run before widgets render
+    if st.session_state.pop("_reset_dep", False):
+        st.session_state.dep_amt = 0.0
+    if st.session_state.pop("_reset_wd", False):
+        st.session_state.wd_amt = 0.0
+    if "dep_amt" not in st.session_state:
+        st.session_state.dep_amt = 0.0
+    if "wd_amt" not in st.session_state:
+        st.session_state.wd_amt = 0.0
+
+    with tab_dep:
+        with st.form("deposit_form"):
+            amount = st.number_input(
+                "Amount to deposit (₹)", min_value=0.0, step=100.0, format="%.2f",
+                help="Added to both total investment and remaining cash.",
+                key="dep_amt",
+            )
+            if amount > 0:
+                st.info(
+                    f"₹{user.investment:,.2f} → **₹{user.investment + amount:,.2f}** (investment)  \n"
+                    f"₹{user.remainingAmount:,.2f} → **₹{user.remainingAmount + amount:,.2f}** (remaining cash)"
+                )
+            if st.form_submit_button("➕ Deposit", use_container_width=True, type="primary"):
+                if amount <= 0:
+                    st.error("Enter an amount greater than ₹0.")
+                else:
+                    u = dm.UserSettings(
+                        userName=user.userName,
+                        investment=user.investment + amount,
+                        remainingAmount=user.remainingAmount + amount,
+                        taxPercentage=user.taxPercentage,
+                        brokeragePercentage=user.brokeragePercentage,
+                        dividendPercentage=user.dividendPercentage,
+                        sellProfitTarget=user.sellProfitTarget,
+                        buyInDipThreshold=user.buyInDipThreshold,
+                    )
+                    dm.save_user(u)
+                    st.session_state.user = u
+                    st.session_state["_reset_dep"] = True  # cleared next run, before widget renders
+                    st.toast(f"✅ ₹{amount:,.2f} deposited — investment now ₹{u.investment:,.2f}", icon="💰")
+                    st.rerun()
+
+    with tab_wd:
+        with st.form("withdraw_form"):
+            max_wd = float(user.remainingAmount)
+            st.caption(f"Available to withdraw: **₹{max_wd:,.2f}** (cash not deployed in market)")
+            amount = st.number_input(
+                "Amount to withdraw (₹)", min_value=0.0, max_value=max_wd,
+                step=100.0, format="%.2f",
+                help="Deducted from both total investment and remaining cash. Cannot exceed available cash.",
+                key="wd_amt",
+            )
+            if amount > 0:
+                st.info(
+                    f"₹{user.investment:,.2f} → **₹{user.investment - amount:,.2f}** (investment)  \n"
+                    f"₹{user.remainingAmount:,.2f} → **₹{user.remainingAmount - amount:,.2f}** (remaining cash)"
+                )
+            if st.form_submit_button("➖ Withdraw", use_container_width=True, type="primary"):
+                if amount <= 0:
+                    st.error("Enter an amount greater than ₹0.")
+                elif amount > max_wd:
+                    st.error(f"Cannot withdraw ₹{amount:,.2f} — only ₹{max_wd:,.2f} is available as cash.")
+                else:
+                    u = dm.UserSettings(
+                        userName=user.userName,
+                        investment=user.investment - amount,
+                        remainingAmount=user.remainingAmount - amount,
+                        taxPercentage=user.taxPercentage,
+                        brokeragePercentage=user.brokeragePercentage,
+                        dividendPercentage=user.dividendPercentage,
+                        sellProfitTarget=user.sellProfitTarget,
+                        buyInDipThreshold=user.buyInDipThreshold,
+                    )
+                    dm.save_user(u)
+                    st.session_state.user = u
+                    st.session_state["_reset_wd"] = True  # cleared next run, before widget renders
+                    st.toast(f"✅ ₹{amount:,.2f} withdrawn — investment now ₹{u.investment:,.2f}", icon="🏦")
+                    st.rerun()
+
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+
+    section("Password")
+    _cfg = dm.load_config()
+    _pwd_on = _cfg.get("passwordEnabled", True)
+    _has_pwd = bool(_cfg.get("passwordHash", ""))
+
+    if _pwd_on and _has_pwd:
+        st.success("🔒 Password protection is **enabled**")
+        col_a, col_b = st.columns(2)
+
+        with col_a.popover("🔓 Disable password", use_container_width=True):
+            st.warning("Anyone with the URL will be able to open the app.")
+            if st.button("Confirm — disable password", type="primary", key="confirm_disable_pwd"):
+                dm.save_config({"passwordEnabled": False, "passwordHash": ""})
+                st.session_state.pop(_SESSION_PARAM, None)
+                if _SESSION_PARAM in st.query_params:
+                    del st.query_params[_SESSION_PARAM]
+                st.toast("🔓 Password disabled", icon="✅")
+                st.rerun()
+
+        with col_b.popover("🔑 Change password", use_container_width=True):
+            new_pwd = st.text_input("New password", type="password", key="chg_pwd_new")
+            cfm_pwd = st.text_input("Confirm", type="password", key="chg_pwd_cfm")
+            if st.button("Save new password", type="primary", key="chg_pwd_save"):
+                if not new_pwd:
+                    st.error("Password cannot be empty.")
+                elif new_pwd != cfm_pwd:
+                    st.error("Passwords do not match.")
+                else:
+                    h = hashlib.sha256(new_pwd.encode()).hexdigest()
+                    dm.save_config({"passwordHash": h, "passwordEnabled": True})
+                    _set_session_token(h)
+                    st.toast("🔑 Password changed", icon="✅")
+                    st.rerun()
+    else:
+        st.warning("🔓 Password protection is **disabled** — anyone with the URL can access the app.")
+        with st.form("enable_pwd_form"):
+            st.markdown("Set a password to re-enable protection:")
+            new_pwd = st.text_input("New password", type="password")
+            cfm_pwd = st.text_input("Confirm", type="password")
+            if st.form_submit_button("🔒 Enable password", type="primary", use_container_width=True):
+                if not new_pwd:
+                    st.error("Password cannot be empty.")
+                elif new_pwd != cfm_pwd:
+                    st.error("Passwords do not match.")
+                else:
+                    h = hashlib.sha256(new_pwd.encode()).hexdigest()
+                    dm.save_config({"passwordHash": h, "passwordEnabled": True})
+                    _set_session_token(h)
+                    st.toast("🔒 Password enabled", icon="✅")
+                    st.rerun()
 
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
     section("Danger zone")
