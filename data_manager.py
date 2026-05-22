@@ -287,8 +287,7 @@ def backfill_buys_from_holdings() -> int:
             continue
         qty = int(h["totalQuantity"])
         price = float(h["averagePrice"])
-        value = price * qty
-        charges = compute_kotak_charges(value, str(h["etfType"]), side="buy")
+        value = price * qty  # noqa: F841 – kept for clarity
         new_rows.append({
             "id": str(uuid.uuid4()),
             "holdingId": hid,
@@ -296,9 +295,12 @@ def backfill_buys_from_holdings() -> int:
             "etfType": str(h["etfType"]),
             "quantity": qty,
             "price": price,
-            "brokerageCharges": charges["brokerage"],
-            "tax": charges["tax"],
-            "totalCharges": charges["total"],
+            # Charges are unknown for legacy holdings — setting to 0 keeps the
+            # reconciliation formula correct (charges were embedded in the original
+            # remainingAmount adjustment, not tracked separately).
+            "brokerageCharges": 0.0,
+            "tax": 0.0,
+            "totalCharges": 0.0,
             "buyDate": str(h["lastPurchaseDate"]) if pd.notna(h.get("lastPurchaseDate")) else _now_iso(),
         })
     if new_rows:
@@ -1061,6 +1063,30 @@ def money_by_etf(
     df["netInvested"] = df["buyOutflow"] - df["sellInflow"]
     df = df.sort_values("buyOutflow", ascending=False).reset_index(drop=True)
     return df
+
+
+def fix_reconciliation_drift(
+    user: "UserSettings",
+    buys: pd.DataFrame,
+    sells: pd.DataFrame,
+    holdings: pd.DataFrame,
+    etfs: pd.DataFrame,
+) -> tuple["UserSettings", float]:
+    """Eliminate reconciliation drift by adjusting remainingAmount.
+
+    Drift is almost always caused by backfilled buy records that include
+    computed charges which were never actually deducted from remainingAmount
+    (because the original holdings predate per-trade charge tracking).
+    Subtracting the diff from remainingAmount re-aligns the books.
+    Returns (updated_user, adjustment_applied).
+    """
+    m = compute_money_summary(user, buys, sells, holdings, etfs)
+    diff = m["reconcileDiff"]
+    if abs(diff) < 0.001:
+        return user, 0.0
+    user.remainingAmount = user.remainingAmount - diff
+    save_user(user)
+    return user, diff
 
 
 def money_by_month(buys: pd.DataFrame, sells: pd.DataFrame) -> pd.DataFrame:

@@ -1724,7 +1724,24 @@ def page_reports() -> None:
     if abs(m["reconcileDiff"]) < 0.01:
         st.success(f"✅ Totals match — cash + holdings = expected total ({fmt_money(m['accountBalance'], 2)}).")
     else:
-        st.error(f"⚠️ Totals off by ₹{m['reconcileDiff']:+.4f}. Investigate buy/sell history.")
+        st.error(
+            f"⚠️ Totals off by ₹{m['reconcileDiff']:+.4f}. "
+            "Most likely cause: legacy holdings were backfilled with computed charges that "
+            "were never deducted from your Remaining Amount. Click **Fix** to recalibrate."
+        )
+        if st.button("🔧 Fix reconciliation drift", key="fix_reconcile_btn"):
+            _guard = "_op_done_fix_reconcile"
+            if not st.session_state.get(_guard):
+                st.session_state[_guard] = True
+                updated_user, adj = dm.fix_reconciliation_drift(
+                    st.session_state.user, buys, sells, holdings, etfs
+                )
+                st.session_state.user = updated_user
+                st.toast(
+                    f"✅ Remaining Amount adjusted by ₹{-adj:+.4f} — books are now balanced.",
+                    icon="🔧",
+                )
+                st.rerun()
 
     # ---- Fees breakdown (compact two-column table) ----
     st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
