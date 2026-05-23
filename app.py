@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import math
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -531,6 +530,12 @@ def _fetch_and_suggest(user: dm.UserSettings) -> tuple[pd.DataFrame, list[dict],
 def ensure_state() -> None:
     if "user" not in st.session_state:
         st.session_state.user = dm.load_user()
+    if "amc_checked" not in st.session_state:
+        updated_user, deducted = dm.check_and_apply_amc(st.session_state.user)
+        st.session_state.user = updated_user
+        st.session_state.amc_checked = True
+        if deducted > 0:
+            st.toast(f"🏦 Auto-deducted Demat AMC ₹{deducted:.2f} — next deduction in 30 days.", icon="🏦")
     if "backfilled" not in st.session_state:
         added = dm.backfill_buys_from_holdings()
         st.session_state.backfilled = True
@@ -639,10 +644,73 @@ with st.sidebar:
     )
 
     st.divider()
-    section("Quick stats")
-    st.markdown(metric_card("Investment", fmt_money(user.investment)), unsafe_allow_html=True)
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.markdown(metric_card("Remaining", fmt_money(user.remainingAmount)), unsafe_allow_html=True)
+
+    # ── Quick stats ───────────────────────────────────────────────────────
+    _sb_holdings    = dm.load_holdings()
+    _sb_cost        = dm.holdings_total_cost(_sb_holdings)
+
+    cash            = user.remainingAmount
+    deposited       = user.totalDeposited           # money physically transferred in
+    eff_budget      = user.investment               # deposited + realized P&L
+    realized_pl     = eff_budget - deposited        # net profit/loss added so far
+    cash_pct        = (cash / eff_budget * 100) if eff_budget else 0
+    dep_pct         = 100 - cash_pct
+
+    # verification: cash + cost_basis should equal effective budget
+    verified        = abs((cash + _sb_cost) - eff_budget) < 1.0
+    ver_color       = "#2ecc71" if verified else "#e74c3c"
+    ver_icon        = "✓" if verified else "✗"
+    ver_diff        = (cash + _sb_cost) - eff_budget
+
+    def _tip(text):
+        return f'<span title="{text}" style="cursor:help;opacity:0.35;font-size:0.62rem;margin-left:3px">ⓘ</span>'
+
+    def _stat(label, value, vc="inherit", tip="", badge="", badge_color="#2ecc71"):
+        badge_html = (
+            f'<span style="display:inline-block;margin-left:7px;padding:1px 7px;'
+            f'border-radius:10px;background:{badge_color}22;color:{badge_color};'
+            f'font-size:0.68rem;font-weight:600;vertical-align:middle">{badge}</span>'
+        ) if badge else ""
+        return (
+            f'<div style="margin-bottom:10px">'
+            f'  <div style="font-size:0.72rem;opacity:0.5;margin-bottom:2px">'
+            f'    {label}{_tip(tip) if tip else ""}'
+            f'  </div>'
+            f'  <div style="font-size:1.05rem;font-weight:700;color:{vc};line-height:1.2">'
+            f'    {value}{badge_html}'
+            f'  </div>'
+            f'</div>'
+        )
+
+    pl_color = "#2ecc71" if realized_pl >= 0 else "#e74c3c"
+    pl_sign  = "+" if realized_pl >= 0 else ""
+    cash_color = "#2ecc71" if cash_pct > 10 else "#e74c3c"
+
+    st.markdown(
+        f'<div style="background:rgba(255,255,255,0.04);border-radius:10px;padding:12px 14px 6px 14px;margin-top:4px">'
+        f'<div style="font-size:0.65rem;font-weight:700;letter-spacing:.1em;opacity:0.35;margin-bottom:12px">QUICK STATS</div>'
+
+        + _stat("You deposited",
+                fmt_money(deposited, 0),
+                tip="Money you actually transferred from your bank into Kotak.")
+
+        + _stat("After profit / loss",
+                fmt_money(eff_budget, 0),
+                vc=pl_color,
+                badge=f"{pl_sign}{fmt_money(realized_pl, 0)}",
+                badge_color=pl_color,
+                tip="Deposited + net realized P&L from all sells.")
+
+        + f'<div style="border-top:1px solid rgba(255,255,255,0.07);margin:4px 0 10px"></div>'
+
+        + _stat("Cash in hand",
+                fmt_money(cash, 0),
+                vc=cash_color,
+                tip=f"Liquid cash available ({cash_pct:.1f}% of budget). Matches your Kotak balance.")
+
+        + f'</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ---------- Pages ----------
@@ -759,11 +827,11 @@ def page_home() -> None:
 
     sell_label  = f"🟢 Sell candidates ({_filtered_count(groups['sell'])})"
     buy_label   = f"🔴 Buy-more candidates ({_filtered_count(groups['buy'])})"
-    other_label = f"⚪ Others ({_filtered_count(groups['others'])})"
+    other_label = f"📋 All Holdings ({_filtered_count(groups['others'])})"
 
     selected = st.radio(
         "Filter",
-        [sell_label, buy_label, other_label],
+        [other_label, sell_label, buy_label],
         horizontal=True,
         label_visibility="collapsed",
         key="home_filter",
@@ -776,7 +844,7 @@ def page_home() -> None:
         st.caption(f"ETFs where CMP < avg × (1 − {user.buyInDipThreshold:.2f}%) — in dip, sorted by |P/L %|")
         _render_holding_cards(groups["buy"], kind="buy")
     else:
-        st.caption("Between thresholds — sorted by |P/L %|")
+        st.caption("Holdings between thresholds — sorted by |P/L %|")
         _render_holding_cards(groups["others"], kind="others")
 
     _render_recent_activity()
@@ -978,7 +1046,7 @@ def _sell_form(row: pd.Series) -> None:
     c1, c2 = st.columns(2)
     default_price = float(row["cmp"]) if row["cmp"] else float(row["averagePrice"])
     sell_price = c1.number_input(
-        "Sell price",
+        "Sell price (per unit)",
         min_value=0.0,
         value=default_price,
         step=0.05,
@@ -990,11 +1058,30 @@ def _sell_form(row: pd.Series) -> None:
         key=f"sq_{row['id']}",
     )
 
-    gross = sell_price * qty
+    kotak_total = st.number_input(
+        "Total received from Kotak (₹) — optional",
+        min_value=0.0,
+        value=0.0,
+        step=0.01,
+        format="%.2f",
+        help="Paste the exact amount credited in your Kotak ledger. "
+             "Overrides per-unit price and eliminates rounding gaps.",
+        key=f"kt_{row['id']}",
+    )
+
+    # Use Kotak total if entered, otherwise fall back to price × qty
+    if kotak_total > 0:
+        effective_price = kotak_total / qty
+        gross = kotak_total
+        st.caption(f"Effective price: ₹{effective_price:.4f}/unit")
+    else:
+        effective_price = sell_price
+        gross = sell_price * qty
+
     ch = dm.compute_kotak_charges(gross, str(row["etfType"]), side="sell")
     dividend = gross * user.dividendPercentage / 100
     net = gross - ch["brokerage"] - ch["tax"] - dividend
-    realized = (sell_price - float(row["averagePrice"])) * qty - ch["brokerage"] - ch["tax"] - dividend
+    realized = (effective_price - float(row["averagePrice"])) * qty - ch["brokerage"] - ch["tax"] - dividend
 
     _render_charge_breakdown(gross, ch, side="sell", dividend=dividend, net=net, realized=realized)
 
@@ -1003,7 +1090,7 @@ def _sell_form(row: pd.Series) -> None:
             holding_id=str(row["id"]),
             name=str(row["etfName"]),
             etf_type=str(row["etfType"]),
-            sell_price=float(sell_price),
+            sell_price=float(effective_price),
             qty=int(qty),
             avg_price=float(row["averagePrice"]),
         )
@@ -1383,17 +1470,26 @@ def _render_charge_breakdown(
 def _buy_more_form(row: pd.Series) -> None:
     c1, c2 = st.columns(2)
     default_price = float(row["cmp"]) if row["cmp"] else float(row["averagePrice"])
-    # Flutter "buy more" default qty = max(1, floor(totalQty × 0.10)) — i.e. 10% top-up
     suggested_qty = max(1, int(int(row["totalQuantity"]) * 0.10))
     price = c1.number_input(
-        "Buy price", min_value=0.0, value=default_price, step=0.05, key=f"bp_{row['id']}"
+        "Buy price (per unit)", min_value=0.0, value=default_price, step=0.05, key=f"bp_{row['id']}"
     )
     qty = c2.number_input(
         "Quantity", min_value=1, value=suggested_qty, step=1, key=f"bq_{row['id']}",
         help=f"Default = 10% of your current holding ({int(row['totalQuantity'])} units) → {suggested_qty}",
     )
+    kotak_total = st.number_input(
+        "Total paid to Kotak (₹) — optional",
+        min_value=0.0, value=0.0, step=0.01, format="%.2f",
+        help="Paste the exact amount Kotak debited for this trade (without charges). "
+             "Overrides per-unit price.",
+        key=f"bkt_{row['id']}",
+    )
+    effective_price = (kotak_total / qty) if kotak_total > 0 else price
+    if kotak_total > 0:
+        st.caption(f"Effective price: ₹{effective_price:.4f}/unit")
 
-    value = price * qty
+    value = effective_price * qty
     ch = dm.compute_kotak_charges(value, str(row["etfType"]), side="buy")
     total_cost = value + ch["total"]
     st.caption(f"Remaining after: **{fmt_money(user.remainingAmount - total_cost)}**")
@@ -1403,7 +1499,7 @@ def _buy_more_form(row: pd.Series) -> None:
         _buy_dialog(
             name=str(row["etfName"]),
             etf_type=str(row["etfType"]),
-            price=float(price),
+            price=float(effective_price),
             qty=int(qty),
         )
 
@@ -1592,16 +1688,94 @@ def page_listed_etfs() -> None:
     )
 
 
+_SH_BATCH = 50
+
+
 def page_sell_history() -> None:
     st.markdown('<h2 style="margin-top:0">📜 Sell History</h2>', unsafe_allow_html=True)
 
-    sells = dm.load_sells()
+    # ── Date filter + page size ───────────────────────────────────────────────
+    if "sh_filter_gen" not in st.session_state:
+        st.session_state["sh_filter_gen"] = 0
+    _gen = st.session_state["sh_filter_gen"]
+
+    fc1, fc2, fc3, fc4 = st.columns([2, 2, 1, 1])
+    sh_from = fc1.date_input("From", value=None, key=f"sh_filter_from_{_gen}",
+                             label_visibility="collapsed", help="Filter from date")
+    sh_to   = fc2.date_input("To",   value=None, key=f"sh_filter_to_{_gen}",
+                             label_visibility="collapsed", help="Filter to date")
+    fc1.caption("From date")
+    fc2.caption("To date")
+
+    _SH_PAGE_OPTIONS = [10, 20, 50, 100]
+    _sh_default = int(user.defaultPageSize) if int(user.defaultPageSize) in _SH_PAGE_OPTIONS else _SH_BATCH
+    sh_batch = fc4.selectbox("Page size", _SH_PAGE_OPTIONS,
+                             index=_SH_PAGE_OPTIONS.index(st.session_state.get("sh_batch", _sh_default)),
+                             key="sh_batch_sel", label_visibility="collapsed",
+                             help="Records per page")
+    fc4.caption("Page size")
+    if sh_batch != st.session_state.get("sh_batch", _sh_default):
+        st.session_state["sh_batch"] = sh_batch
+        for k in list(st.session_state.keys()):
+            if k.startswith("sh_df") or k.startswith("sh_cursor") \
+                    or k.startswith("sh_has_more") or k.startswith("sh_total"):
+                st.session_state.pop(k)
+        st.rerun()
+    sh_batch = st.session_state.get("sh_batch", _sh_default)
+
+    sh_filter_active = sh_from is not None or sh_to is not None
+    if fc3.button("✕ Clear", key="sh_filter_clear", disabled=not sh_filter_active, use_container_width=True):
+        st.session_state["sh_filter_gen"] += 1
+        for k in list(st.session_state.keys()):
+            if k.startswith("sh_df") or k.startswith("sh_cursor") \
+                    or k.startswith("sh_has_more") or k.startswith("sh_total") \
+                    or k == "sh_filter_key":
+                del st.session_state[k]
+        st.rerun()
+
+    if sh_filter_active:
+        from_s = sh_from.isoformat() if sh_from else "1900-01-01"
+        to_s   = sh_to.isoformat()   if sh_to   else "2999-12-31"
+        fkey   = f"{from_s}_{to_s}"
+        if st.session_state.get("sh_filter_key") != fkey:
+            for k in list(st.session_state.keys()):
+                if k.startswith("sh_df") or k.startswith("sh_cursor") \
+                        or k.startswith("sh_has_more") or k.startswith("sh_total"):
+                    del st.session_state[k]
+            st.session_state["sh_filter_key"] = fkey
+    else:
+        from_s = to_s = None
+        if st.session_state.get("sh_filter_key") is not None:
+            st.session_state.pop("sh_filter_key", None)
+            for k in list(st.session_state.keys()):
+                if k.startswith("sh_df") or k.startswith("sh_cursor") \
+                        or k.startswith("sh_has_more") or k.startswith("sh_total"):
+                    st.session_state.pop(k)
+
+    # ── Load first page if not cached ────────────────────────────────────────
+    if "sh_df" not in st.session_state:
+        if from_s and to_s:
+            df, cursor = dm.fetch_sells_in_range(from_s, to_s, sh_batch)
+            total = dm.count_in_range("sells", "sellDate", from_s, to_s)
+        else:
+            df, cursor = dm.fetch_sells_page(sh_batch)
+            total = dm.count_collection("sells")
+        st.session_state["sh_df"]       = df
+        st.session_state["sh_cursor"]   = cursor
+        st.session_state["sh_has_more"] = cursor is not None
+        st.session_state["sh_total"]    = total
+
+    sells    = st.session_state["sh_df"]
+    loaded   = len(sells)
+    total    = st.session_state.get("sh_total", loaded)
+    has_more = st.session_state.get("sh_has_more", False)
+
     if sells.empty:
-        st.info("No sell transactions yet.")
+        st.info("No sell transactions found." if sh_filter_active else "No sell transactions yet.")
         return
 
     view = sells.copy()
-    q = view["quantity"].astype(float)
+    q  = view["quantity"].astype(float)
     sp = view["sellPrice"].astype(float)
     ap = view["averagePurchasePrice"].astype(float)
     view["grossPL"] = (sp - ap) * q
@@ -1612,50 +1786,136 @@ def page_sell_history() -> None:
         - view["dividendPaidToSelf"].astype(float)
     )
 
-    # Summary
+    # ── Summary cards ────────────────────────────────────────────────────────
     c1, c2, c3 = st.columns(3)
-    c1.markdown(metric_card("Total Transactions", f"{len(view)}"), unsafe_allow_html=True)
+    label_sfx = f" (of {total})" if has_more else ""
+    c1.markdown(metric_card("Transactions shown", f"{loaded}{label_sfx}"), unsafe_allow_html=True)
     total_gross = float(view["grossPL"].sum())
-    total_net = float(view["netPL"].sum())
+    total_net   = float(view["netPL"].sum())
     c2.markdown(
-        metric_card("Gross P/L", fmt_money(total_gross), delta_class=pnl_class(total_gross)),
+        metric_card("Gross P/L" + (" ↗" if has_more else ""), fmt_money(total_gross), delta_class=pnl_class(total_gross)),
         unsafe_allow_html=True,
     )
     c3.markdown(
-        metric_card("Net P/L", fmt_money(total_net), delta_class=pnl_class(total_net)),
+        metric_card("Net P/L" + (" ↗" if has_more else ""), fmt_money(total_net), delta_class=pnl_class(total_net)),
         unsafe_allow_html=True,
     )
+    if has_more:
+        st.caption(f"↗ Showing {loaded} of {total} sells — load more below to include all records in the totals.")
 
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
-    show = view[[
-        "sellDate", "etfName", "etfType", "quantity",
-        "averagePurchasePrice", "sellPrice",
-        "brokerageCharges", "tax", "dividendPaidToSelf",
-        "grossPL", "netPL",
-    ]].copy()
-    show.columns = [
-        "Sell Date", "ETF", "Type", "Qty",
-        "Avg Buy", "Sell",
-        "Brokerage", "Tax", "Dividend",
-        "Gross P/L", "Net P/L",
-    ]
-    show = show.sort_values("Sell Date", ascending=False)
-
-    st.dataframe(
-        show,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Avg Buy":   st.column_config.NumberColumn(format="₹%.2f"),
-            "Sell":      st.column_config.NumberColumn(format="₹%.2f"),
-            "Brokerage": st.column_config.NumberColumn(format="₹%.2f"),
-            "Tax":       st.column_config.NumberColumn(format="₹%.2f"),
-            "Dividend":  st.column_config.NumberColumn(format="₹%.2f"),
-            "Gross P/L": st.column_config.NumberColumn(format="₹%.2f"),
-            "Net P/L":   st.column_config.NumberColumn(format="₹%.2f"),
-        },
+    # ── Cards ────────────────────────────────────────────────────────────────
+    view["_dt"] = pd.to_datetime(view["sellDate"], errors="coerce")
+    view = view.sort_values("_dt", ascending=False, na_position="last").reset_index(drop=True)
+    view["_label"] = view["_dt"].apply(
+        lambda dt: _chat_date_label(dt) if pd.notna(dt) else "Unknown date"
     )
+    counts = view["_label"].value_counts().to_dict()
+
+    if sh_filter_active:
+        st.caption(f"{loaded} sells in selected date range")
+    else:
+        st.caption(f"Showing {loaded} of {total} sells (newest first)")
+
+    last_label = None
+    for _, row in view.iterrows():
+        label = row["_label"]
+        if label != last_label:
+            n = counts.get(label, 0)
+            _render_date_separator(f"{label} · {n} {'sell' if n == 1 else 'sells'}")
+            last_label = label
+
+        gross = float(row["grossPL"])
+        net   = float(row["netPL"])
+        brok  = float(row["brokerageCharges"])
+        tax   = float(row["tax"])
+        div   = float(row["dividendPaidToSelf"])
+        qty        = int(row["quantity"])
+        avg_buy    = float(row["averagePurchasePrice"])
+        sell_p     = float(row["sellPrice"])
+        invested   = avg_buy * qty
+        sell_val   = sell_p * qty
+        fees_total = brok + tax + div
+        with st.container(border=True):
+            # ── Header ────────────────────────────────────────────────────
+            hc1, hc2 = st.columns([4, 1])
+            hc1.markdown(
+                f'**{row["etfName"]}** &nbsp; {badge(str(row["etfType"]), "equity")}',
+                unsafe_allow_html=True,
+            )
+            hc2.markdown(
+                f'<div class="text-muted" style="font-size:0.8rem;text-align:right">{row["sellDate"]}</div>',
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+
+            # ── Formula: INVESTED → RECEIVED − CHARGES = NET ─────────────
+            b, arr1, s, arr2, c, arr3, n = st.columns([4, 1, 4, 1, 3, 1, 3])
+
+            b.markdown(
+                f'<div style="background:var(--secondary-background-color);border-radius:10px;padding:12px 14px">'
+                f'<div class="text-muted" style="font-size:0.7rem;letter-spacing:.06em;margin-bottom:4px">INVESTED</div>'
+                f'<div style="font-size:0.85rem">{qty} units &times; ₹{avg_buy:,.2f}</div>'
+                f'<div style="font-size:1.15rem;font-weight:700;margin-top:2px">{fmt_money(invested)}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            arr1.markdown(
+                '<div style="text-align:center;font-size:1.4rem;padding-top:22px;opacity:0.4">→</div>',
+                unsafe_allow_html=True,
+            )
+            s.markdown(
+                f'<div style="background:var(--secondary-background-color);border-radius:10px;padding:12px 14px">'
+                f'<div class="text-muted" style="font-size:0.7rem;letter-spacing:.06em;margin-bottom:4px">RECEIVED</div>'
+                f'<div style="font-size:0.85rem">{qty} units &times; ₹{sell_p:,.2f}</div>'
+                f'<div style="font-size:1.15rem;font-weight:700;margin-top:2px">{fmt_money(sell_val)}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            arr2.markdown(
+                '<div style="text-align:center;font-size:1.4rem;padding-top:22px;opacity:0.4">−</div>',
+                unsafe_allow_html=True,
+            )
+            c.markdown(
+                f'<div style="background:var(--secondary-background-color);border-radius:10px;padding:12px 14px">'
+                f'<div class="text-muted" style="font-size:0.7rem;letter-spacing:.06em;margin-bottom:4px">CHARGES</div>'
+                f'<div style="font-size:0.78rem;line-height:1.6">'
+                f'Brok {fmt_money(brok,2)} &nbsp;·&nbsp; Tax {fmt_money(tax,2)} &nbsp;·&nbsp; Div {fmt_money(div,2)}</div>'
+                f'<div style="font-size:1.15rem;font-weight:700;margin-top:2px">{fmt_money(fees_total)}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            net_color = "#2ecc71" if net >= 0 else "#e74c3c"
+            arr3.markdown(
+                '<div style="text-align:center;font-size:1.4rem;padding-top:22px;opacity:0.4">=</div>',
+                unsafe_allow_html=True,
+            )
+            n.markdown(
+                f'<div style="border:2px solid {net_color};border-radius:10px;padding:12px 14px">'
+                f'<div class="text-muted" style="font-size:0.7rem;letter-spacing:.06em;margin-bottom:4px">NET P/L</div>'
+                f'<div style="font-size:0.85rem;opacity:0.6">gross {fmt_money(gross)}</div>'
+                f'<div style="font-size:1.25rem;font-weight:700;color:{net_color};margin-top:2px">{fmt_money(net)}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    if has_more:
+        remaining  = total - loaded
+        next_batch = min(sh_batch, remaining)
+        if st.button(f"⬇ Load {next_batch} more  ({loaded} of {total})", key="sh_load_more", use_container_width=True):
+            cursor = st.session_state.get("sh_cursor")
+            if from_s and to_s:
+                new_df, new_cursor = dm.fetch_sells_in_range(from_s, to_s, sh_batch, cursor)
+            else:
+                new_df, new_cursor = dm.fetch_sells_page(sh_batch, cursor)
+            st.session_state["sh_df"] = pd.concat(
+                [st.session_state["sh_df"], new_df], ignore_index=True
+            )
+            st.session_state["sh_cursor"]   = new_cursor
+            st.session_state["sh_has_more"] = new_cursor is not None
+            st.rerun()
 
 
 def page_reports() -> None:
@@ -1663,71 +1923,82 @@ def page_reports() -> None:
     st.caption("How much money you used, where it went, and whether the totals add up.")
 
     holdings = dm.load_holdings()
-    sells = dm.load_sells()
-    buys = dm.load_buys()
+    sells    = dm.load_sells()
+    buys     = dm.load_buys()
+    charges  = dm.load_charges()
+    amc_total = charges["amount"].astype(float).sum() if not charges.empty else 0.0
     r = dm.compute_report(holdings, sells, etfs)
     m = dm.compute_money_summary(user, buys, sells, holdings, etfs)
 
-    # ---- Money snapshot (4 cards) ----
+    # ── Portfolio snapshot ────────────────────────────────────────────────
+    section("Portfolio snapshot")
     c1, c2, c3, c4 = st.columns(4)
-    c1.markdown(metric_card("Initial deposit", fmt_money(m["initialDeposit"], 2)),
-                unsafe_allow_html=True)
-    c2.markdown(metric_card("Cash remaining", fmt_money(m["remainingCash"], 2)),
-                unsafe_allow_html=True)
-    c3.markdown(metric_card("Money in holdings", fmt_money(m["costBasis"], 2)),
-                unsafe_allow_html=True)
+    c1.markdown(metric_card("Initial deposit",    fmt_money(m["initialDeposit"], 2)), unsafe_allow_html=True)
+    c2.markdown(metric_card("Cash remaining",     fmt_money(m["remainingCash"],  2)), unsafe_allow_html=True)
+    c3.markdown(metric_card("Money in holdings",  fmt_money(m["costBasis"],      2)), unsafe_allow_html=True)
     c4.markdown(
         metric_card("Current value", fmt_money(m["currentValue"], 2),
                     delta=fmt_pct(r["portfolioPct"]) if m["costBasis"] else None,
                     delta_class=pnl_class(m["unrealizedPL"])),
         unsafe_allow_html=True,
     )
-
-    # ---- Money used / received / fees (one row, 4 cards) ----
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     u1, u2, u3, u4 = st.columns(4)
-    u1.markdown(
-        metric_card(f"Spent on buys ({m['buyCount']})", fmt_money(m["buyOutflow"], 2)),
-        unsafe_allow_html=True,
-    )
-    u2.markdown(
-        metric_card(f"Got from sells ({m['sellCount']})", fmt_money(m["sellInflow"], 2)),
-        unsafe_allow_html=True,
-    )
-    u3.markdown(
-        metric_card("Fees paid total", fmt_money(m["feesPaidTotal"], 2)),
-        unsafe_allow_html=True,
-    )
+    u1.markdown(metric_card(f"Spent on buys ({m['buyCount']})",   fmt_money(m["buyOutflow"],  2)), unsafe_allow_html=True)
+    u2.markdown(metric_card(f"Got from sells ({m['sellCount']})", fmt_money(m["sellInflow"],  2)), unsafe_allow_html=True)
+    u3.markdown(metric_card("Fees paid total", fmt_money(m["feesPaidTotal"] + amc_total, 2)),      unsafe_allow_html=True)
     u4.markdown(
-        metric_card("Realized profit", fmt_money(m["sellNetPL"], 2),
-                    delta_class=pnl_class(m["sellNetPL"])),
+        metric_card("Realized profit", fmt_money(m["sellNetPL"], 2), delta_class=pnl_class(m["sellNetPL"])),
         unsafe_allow_html=True,
     )
 
-    # ---- Verification (math always visible) ----
-    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    # ── Verify the totals (ledger style) ──────────────────────────────────
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
     section("Verify the totals")
-    flow = pd.DataFrame([
-        ("Initial deposit",                   m["initialDeposit"]),
-        ("+ Profit from sells (gross)",       m["sellGrossPL"]),
-        ("− Fees on buys",                   -m["buyTotalCharges"]),
-        ("− Fees on sells",                  -m["sellFeesTotal"]),
-        ("− Dividend paid to self",          -m["sellDividend"]),
-        ("= Expected total",                  m["expectedBalance"]),
-        ("Cash remaining + holdings cost",    m["accountBalance"]),
-        ("Difference",                        m["reconcileDiff"]),
-    ], columns=["Item", "Amount"])
-    st.dataframe(
-        flow, use_container_width=True, hide_index=True,
-        column_config={"Amount": st.column_config.NumberColumn(format="₹%.4f")},
-    )
-    if abs(m["reconcileDiff"]) < 0.01:
-        st.success(f"✅ Totals match — cash + holdings = expected total ({fmt_money(m['accountBalance'], 2)}).")
+
+    def _lrow(label, amount, bold=False, indent=False, separator=False):
+        prefix = "&nbsp;&nbsp;&nbsp;" if indent else ""
+        w      = "700" if bold else "400"
+        sign   = "−" if amount < 0 else ("+" if amount > 0 and not bold else "")
+        color  = "inherit"
+        if bold and abs(amount) > 0:
+            color = "#2ecc71" if amount > 0 else "#e74c3c"
+        top = "border-top:1px solid var(--secondary-background-color);margin-top:6px;padding-top:6px;" if separator else ""
+        return (
+            f'<div style="display:flex;justify-content:space-between;padding:3px 0;{top}">'
+            f'<span style="font-weight:{w};opacity:{"1" if bold else "0.85"}">{prefix}{label}</span>'
+            f'<span style="font-weight:{w};color:{color};font-variant-numeric:tabular-nums">'
+            f'{sign}₹{abs(amount):,.4f}</span></div>'
+        )
+
+    diff      = m["reconcileDiff"]
+    diff_sign = "+" if diff >= 0 else "−"
+    diff_col  = "#2ecc71" if abs(diff) < 0.01 else "#e74c3c"
+    diff_icon = "✓" if abs(diff) < 0.01 else "✗"
+
+    with st.container(border=True):
+        st.markdown(
+            _lrow("Initial deposit",             m["initialDeposit"])
+            + _lrow("+ Profit from sells (gross)", m["sellGrossPL"],    indent=True)
+            + _lrow("− Fees on buys",             -m["buyTotalCharges"], indent=True)
+            + _lrow("− Fees on sells",            -m["sellFeesTotal"],   indent=True)
+            + _lrow("− Dividend paid to self",    -m["sellDividend"],    indent=True)
+            + _lrow("= Expected total",            m["expectedBalance"],  bold=True, separator=True)
+            + _lrow("Cash remaining + holdings",   m["accountBalance"],  indent=True)
+            + f'<div style="display:flex;justify-content:space-between;padding:3px 0;'
+              f'border-top:1px solid var(--secondary-background-color);margin-top:6px;padding-top:6px;">'
+              f'<span style="font-weight:700">Difference</span>'
+              f'<span style="font-weight:700;color:{diff_col};font-variant-numeric:tabular-nums">'
+              f'{diff_sign}₹{abs(diff):,.4f} &nbsp;{diff_icon}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    if abs(diff) < 0.01:
+        st.success(f"✅ Totals match — cash + holdings = expected ({fmt_money(m['accountBalance'], 2)}).")
     else:
         st.error(
-            f"⚠️ Totals off by ₹{m['reconcileDiff']:+.4f}. "
-            "Most likely cause: legacy holdings were backfilled with computed charges that "
-            "were never deducted from your Remaining Amount. Click **Fix** to recalibrate."
+            f"⚠️ Totals off by ₹{diff:+.4f}. "
+            "Legacy holdings may have been backfilled with charges never deducted from Remaining Amount."
         )
         if st.button("🔧 Fix reconciliation drift", key="fix_reconcile_btn"):
             _guard = "_op_done_fix_reconcile"
@@ -1737,30 +2008,32 @@ def page_reports() -> None:
                     st.session_state.user, buys, sells, holdings, etfs
                 )
                 st.session_state.user = updated_user
-                st.toast(
-                    f"✅ Remaining Amount adjusted by ₹{-adj:+.4f} — books are now balanced.",
-                    icon="🔧",
-                )
+                st.toast(f"✅ Remaining Amount adjusted by ₹{-adj:+.4f} — books balanced.", icon="🔧")
                 st.rerun()
 
-    # ---- Fees breakdown (compact two-column table) ----
-    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    # ── Fees breakdown (cards) ────────────────────────────────────────────
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
     section("What made up the fees")
-    fees_breakdown = pd.DataFrame([
-        ("Brokerage on buys",                m["buyBrokerage"]),
-        ("Statutory on buys (STT/stamp/exch/SEBI/GST)", m["buyTax"]),
-        ("Brokerage on sells",               m["sellBrokerage"]),
-        ("Statutory on sells",               m["sellTax"]),
-        ("Dividend paid to self",            m["sellDividend"]),
-        ("Total money consumed",             m["moneyConsumed"]),
-    ], columns=["Item", "Amount"])
-    st.dataframe(
-        fees_breakdown, use_container_width=True, hide_index=True,
-        column_config={"Amount": st.column_config.NumberColumn(format="₹%.4f")},
+    fees_items = [
+        ("Brokerage on buys",         m["buyBrokerage"]),
+        ("Statutory on buys",         m["buyTax"]),
+        ("Brokerage on sells",        m["sellBrokerage"]),
+        ("Statutory on sells",        m["sellTax"]),
+        ("Dividend paid to self",     m["sellDividend"]),
+        ("Demat AMC & charges",       amc_total),
+    ]
+    cols = st.columns(len(fees_items))
+    for col, (label, val) in zip(cols, fees_items):
+        col.markdown(metric_card(label, fmt_money(val, 2)), unsafe_allow_html=True)
+    total_consumed = m["moneyConsumed"] + amc_total
+    st.markdown(
+        f'<div style="text-align:right;margin-top:6px;font-size:0.85rem">'
+        f'Total money consumed &nbsp;<b>{fmt_money(total_consumed, 2)}</b></div>',
+        unsafe_allow_html=True,
     )
 
-    # ---- Per-ETF money usage ----
-    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    # ── Per-ETF breakdown ─────────────────────────────────────────────────
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
     section("Where the money went (per ETF)")
     per_etf = dm.money_by_etf(buys, sells, holdings, etfs)
     if per_etf.empty:
@@ -1774,21 +2047,21 @@ def page_reports() -> None:
         ]].copy()
         show.columns = [
             "ETF", "Type",
-            "Spent (incl. fees)", "Received (after fees)",
+            "Spent", "Received",
             "Held Qty", "In holdings", "Worth now", "Unrealized P/L",
             "Realized P/L", "Net invested",
         ]
         st.dataframe(
             show, use_container_width=True, hide_index=True,
             column_config={
-                "Spent (incl. fees)":    st.column_config.NumberColumn(format="₹%.2f"),
-                "Received (after fees)": st.column_config.NumberColumn(format="₹%.2f"),
-                "Held Qty":              st.column_config.NumberColumn(format="%.0f"),
-                "In holdings":           st.column_config.NumberColumn(format="₹%.2f"),
-                "Worth now":             st.column_config.NumberColumn(format="₹%.2f"),
-                "Unrealized P/L":        st.column_config.NumberColumn(format="₹%.2f"),
-                "Realized P/L":          st.column_config.NumberColumn(format="₹%.2f"),
-                "Net invested":          st.column_config.NumberColumn(format="₹%.2f"),
+                "Spent":           st.column_config.NumberColumn(format="₹%.2f"),
+                "Received":        st.column_config.NumberColumn(format="₹%.2f"),
+                "Held Qty":        st.column_config.NumberColumn(format="%.0f"),
+                "In holdings":     st.column_config.NumberColumn(format="₹%.2f"),
+                "Worth now":       st.column_config.NumberColumn(format="₹%.2f"),
+                "Unrealized P/L":  st.column_config.NumberColumn(format="₹%.2f"),
+                "Realized P/L":    st.column_config.NumberColumn(format="₹%.2f"),
+                "Net invested":    st.column_config.NumberColumn(format="₹%.2f"),
             },
         )
         st.caption(
@@ -1798,27 +2071,46 @@ def page_reports() -> None:
             f"current value {fmt_money(per_etf['currentValue'].sum(), 2)}"
         )
 
-    # ---- Allocation by type ----
+    # ── Allocation by type (cards) ────────────────────────────────────────
     alloc = dm.holdings_by_type(holdings, etfs)
     if not alloc.empty:
-        st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
         section("By type (current holdings)")
-        a = alloc[["etfType", "count", "cost", "currentValue", "pnl", "pnlPct"]].copy()
-        a.columns = ["Type", "# Holdings", "Cost", "Current value", "Unrealized P/L", "P/L %"]
-        st.dataframe(
-            a, use_container_width=True, hide_index=True,
-            column_config={
-                "Cost":           st.column_config.NumberColumn(format="₹%.2f"),
-                "Current value":  st.column_config.NumberColumn(format="₹%.2f"),
-                "Unrealized P/L": st.column_config.NumberColumn(format="₹%.2f"),
-                "P/L %":          st.column_config.NumberColumn(format="%.2f %%"),
-            },
-        )
+        for _, row in alloc.iterrows():
+            pnl_c = "#2ecc71" if float(row["pnl"]) >= 0 else "#e74c3c"
+            with st.container(border=True):
+                t1, t2, t3, t4, t5 = st.columns([2, 2, 2, 2, 2])
+                t1.markdown(
+                    f'<div class="text-muted" style="font-size:0.7rem">TYPE</div>'
+                    f'<div style="font-weight:700;font-size:1rem">{row["etfType"]}</div>'
+                    f'<div class="text-muted" style="font-size:0.78rem">{int(row["count"])} holdings</div>',
+                    unsafe_allow_html=True,
+                )
+                t2.markdown(
+                    f'<div class="text-muted" style="font-size:0.7rem">INVESTED</div>'
+                    f'<div style="font-size:1rem;font-weight:600">{fmt_money(float(row["cost"]))}</div>',
+                    unsafe_allow_html=True,
+                )
+                t3.markdown(
+                    f'<div class="text-muted" style="font-size:0.7rem">WORTH NOW</div>'
+                    f'<div style="font-size:1rem;font-weight:600">{fmt_money(float(row["currentValue"]))}</div>',
+                    unsafe_allow_html=True,
+                )
+                t4.markdown(
+                    f'<div class="text-muted" style="font-size:0.7rem">UNREALIZED P/L</div>'
+                    f'<div style="font-size:1rem;font-weight:600;color:{pnl_c}">{fmt_money(float(row["pnl"]))}</div>',
+                    unsafe_allow_html=True,
+                )
+                t5.markdown(
+                    f'<div class="text-muted" style="font-size:0.7rem">P/L %</div>'
+                    f'<div style="font-size:1rem;font-weight:600;color:{pnl_c}">{float(row["pnlPct"]):+.2f}%</div>',
+                    unsafe_allow_html=True,
+                )
 
-    # ---- Month-by-month ----
+    # ── Month by month ────────────────────────────────────────────────────
     monthly = dm.money_by_month(buys, sells)
     if not monthly.empty:
-        st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
         section("Month by month")
         mv = monthly.copy()
         mv.columns = ["Month", "Spent on buys", "Buy fees",
@@ -1880,6 +2172,24 @@ def page_settings() -> None:
         sell_target = c6.number_input("Sell Profit Target %", min_value=0.0, value=float(user.sellProfitTarget), step=0.1, format="%.2f")
         buy_dip = c7.number_input("Buy-in-Dip Threshold %", min_value=0.0, value=float(user.buyInDipThreshold), step=0.1, format="%.2f")
 
+        section("Display")
+        _PS_OPTIONS = [10, 20, 50, 100]
+        default_page_size = st.selectbox(
+            "Default page size (Transactions & Sell History)",
+            _PS_OPTIONS,
+            index=_PS_OPTIONS.index(int(user.defaultPageSize)) if int(user.defaultPageSize) in _PS_OPTIONS else 1,
+            help="How many records to load per page by default. You can still change it on each page.",
+        )
+
+        section("Demat AMC (Auto-deduction)")
+        amc_amount = st.number_input(
+            "Monthly AMC charge (₹)",
+            min_value=0.0, value=float(user.amcAmount), step=0.01, format="%.2f",
+            help="Auto-deducted from investment + remaining every 30 days. Set to 0 to disable.",
+        )
+        if user.lastAmcDate:
+            st.caption(f"Last deducted: **{user.lastAmcDate}** · Next: 30 days after that")
+
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
         if st.form_submit_button("💾 Save", use_container_width=True, type="primary"):
@@ -1890,11 +2200,15 @@ def page_settings() -> None:
                 userName=name,
                 investment=float(investment),
                 remainingAmount=float(remaining),
-                taxPercentage=0.0,      # auto-computed per trade
-                brokeragePercentage=0.0,  # auto-computed per trade
+                taxPercentage=0.0,
+                brokeragePercentage=0.0,
                 dividendPercentage=float(dividend_pct),
                 sellProfitTarget=float(sell_target),
                 buyInDipThreshold=float(buy_dip),
+                amcAmount=float(amc_amount),
+                lastAmcDate=user.lastAmcDate,
+                totalDeposited=user.totalDeposited,
+                defaultPageSize=int(default_page_size),
             )
             dm.save_user(u)
             st.session_state.user = u
@@ -1903,18 +2217,22 @@ def page_settings() -> None:
 
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
-    section("Deposit / Withdraw")
-    tab_dep, tab_wd = st.tabs(["➕ Deposit", "➖ Withdraw"])
+    section("Deposit / Withdraw / Charges")
+    tab_dep, tab_wd, tab_ch = st.tabs(["➕ Deposit", "➖ Withdraw", "🏦 Kotak Charges"])
 
     # Reset flags are set on successful submit, applied on the NEXT run before widgets render
     if st.session_state.pop("_reset_dep", False):
         st.session_state.dep_amt = 0.0
     if st.session_state.pop("_reset_wd", False):
         st.session_state.wd_amt = 0.0
+    if st.session_state.pop("_reset_ch", False):
+        st.session_state.ch_amt = 0.0
     if "dep_amt" not in st.session_state:
         st.session_state.dep_amt = 0.0
     if "wd_amt" not in st.session_state:
         st.session_state.wd_amt = 0.0
+    if "ch_amt" not in st.session_state:
+        st.session_state.ch_amt = 0.0
 
     with tab_dep:
         with st.form("deposit_form"):
@@ -1941,8 +2259,12 @@ def page_settings() -> None:
                         dividendPercentage=user.dividendPercentage,
                         sellProfitTarget=user.sellProfitTarget,
                         buyInDipThreshold=user.buyInDipThreshold,
+                        amcAmount=user.amcAmount,
+                        lastAmcDate=user.lastAmcDate,
+                        totalDeposited=user.totalDeposited + amount,
                     )
                     dm.save_user(u)
+                    dm.save_cashflow("deposit", amount)
                     st.session_state.user = u
                     st.session_state["_reset_dep"] = True  # cleared next run, before widget renders
                     st.toast(f"✅ ₹{amount:,.2f} deposited — investment now ₹{u.investment:,.2f}", icon="💰")
@@ -1978,11 +2300,67 @@ def page_settings() -> None:
                         dividendPercentage=user.dividendPercentage,
                         sellProfitTarget=user.sellProfitTarget,
                         buyInDipThreshold=user.buyInDipThreshold,
+                        amcAmount=user.amcAmount,
+                        lastAmcDate=user.lastAmcDate,
+                        totalDeposited=user.totalDeposited - amount,
                     )
                     dm.save_user(u)
+                    dm.save_cashflow("withdrawal", amount)
                     st.session_state.user = u
                     st.session_state["_reset_wd"] = True  # cleared next run, before widget renders
                     st.toast(f"✅ ₹{amount:,.2f} withdrawn — investment now ₹{u.investment:,.2f}", icon="🏦")
+                    st.rerun()
+
+    with tab_ch:
+        st.caption(
+            "Record charges already deducted by Kotak — Demat AMC, or any other platform fee. "
+            "Use the date field to backfill past charges."
+        )
+        with st.form("charges_form"):
+            ca, cb = st.columns(2)
+            amount = ca.number_input(
+                "Charge amount (₹)", min_value=0.0, step=1.0, format="%.2f",
+                help="e.g. ₹18.88 for monthly Demat AMC.",
+                key="ch_amt",
+            )
+            charge_date = cb.date_input(
+                "Date debited",
+                value=datetime.today().date(),
+                help="Use the actual date Kotak debited the charge.",
+                key="ch_date",
+            )
+            description = st.text_input(
+                "Description (optional)",
+                placeholder="e.g. Demat AMC for April 2026",
+                key="ch_desc",
+            )
+            if amount > 0:
+                st.info(
+                    f"₹{user.investment:,.2f} → **₹{user.investment - amount:,.2f}** (investment)  \n"
+                    f"₹{user.remainingAmount:,.2f} → **₹{user.remainingAmount - amount:,.2f}** (remaining cash)"
+                )
+            if st.form_submit_button("💸 Record Charge", use_container_width=True, type="primary"):
+                if amount <= 0:
+                    st.error("Enter an amount greater than ₹0.")
+                else:
+                    desc = description.strip() or f"Demat AMC — {charge_date.isoformat()}"
+                    u = dm.UserSettings(
+                        userName=user.userName,
+                        investment=user.investment - amount,
+                        remainingAmount=user.remainingAmount - amount,
+                        taxPercentage=user.taxPercentage,
+                        brokeragePercentage=user.brokeragePercentage,
+                        dividendPercentage=user.dividendPercentage,
+                        sellProfitTarget=user.sellProfitTarget,
+                        buyInDipThreshold=user.buyInDipThreshold,
+                        amcAmount=user.amcAmount,
+                        lastAmcDate=user.lastAmcDate,
+                    )
+                    dm.save_user(u)
+                    dm.save_charge("AMC", amount, desc, charge_date.isoformat())
+                    st.session_state.user = u
+                    st.session_state["_reset_ch"] = True
+                    st.toast(f"✅ ₹{amount:.2f} on {charge_date.isoformat()} recorded.", icon="💸")
                     st.rerun()
 
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
@@ -2083,31 +2461,351 @@ def page_settings() -> None:
     )
 
 
+@st.dialog("Edit Sell Price")
+def _edit_sell_dialog(sell_id: str, name: str, qty: int, old_price: float) -> None:
+    old_total = old_price * qty
+    st.markdown(f"**✏️ {name}** — {qty} units", unsafe_allow_html=True)
+    st.caption(f"Current recorded price: ₹{old_price:,.4f}/unit  |  Total: ₹{old_total:,.2f}")
+    st.markdown("---")
+    new_price = st.number_input(
+        "Sell price per unit (₹)",
+        min_value=0.0001,
+        value=round(old_price, 4),
+        step=0.0001,
+        format="%.4f",
+        help="Enter the exact per-unit sell price. The app will compute total and recalculate charges.",
+    )
+    new_total = new_price * qty
+    if abs(new_price - old_price) > 0.00001:
+        st.info(f"New total: ₹{new_total:,.2f}  |  Difference: ₹{new_total - old_total:+.2f}")
+    c1, c2 = st.columns(2)
+    if c1.button("💾 Save", type="primary", use_container_width=True, key="edit_sell_save"):
+        _guard = f"_edit_sell_{sell_id}"
+        if not st.session_state.get(_guard):
+            st.session_state[_guard] = True
+            try:
+                dm.update_sell_price(sell_id, new_total)
+                st.toast(f"✅ Updated to ₹{new_price:.4f}/unit", icon="✏️")
+                st.rerun()
+            except Exception as e:
+                del st.session_state[_guard]
+                st.error(str(e))
+    if c2.button("Cancel", use_container_width=True, key="edit_sell_cancel"):
+        st.rerun()
+
+
+@st.dialog("Edit Buy Price")
+def _edit_buy_dialog(buy_id: str, name: str, qty: int, old_price: float) -> None:
+    old_total = old_price * qty
+    st.markdown(f"**✏️ {name}** — {qty} units", unsafe_allow_html=True)
+    st.caption(f"Current recorded price: ₹{old_price:,.4f}/unit  |  Total: ₹{old_total:,.2f}")
+    st.markdown("---")
+    new_price = st.number_input(
+        "Buy price per unit (₹)",
+        min_value=0.0001,
+        value=round(old_price, 4),
+        step=0.0001,
+        format="%.4f",
+        help="Enter the exact per-unit buy price. The app will compute total, recalculate charges, and adjust your balance.",
+    )
+    new_total = new_price * qty
+    if abs(new_price - old_price) > 0.00001:
+        st.info(f"New total: ₹{new_total:,.2f}  |  Difference: ₹{new_total - old_total:+.2f}")
+    c1, c2 = st.columns(2)
+    if c1.button("💾 Save", type="primary", use_container_width=True, key="edit_buy_save"):
+        _guard = f"_edit_buy_{buy_id}"
+        if not st.session_state.get(_guard):
+            st.session_state[_guard] = True
+            try:
+                updated_user = dm.update_buy_price(st.session_state.user, buy_id, new_total)
+                st.session_state.user = updated_user
+                st.toast(f"✅ Updated to ₹{new_price:.4f}/unit", icon="✏️")
+                st.rerun()
+            except Exception as e:
+                del st.session_state[_guard]
+                st.error(str(e))
+    if c2.button("Cancel", use_container_width=True, key="edit_buy_cancel"):
+        st.rerun()
+
+
+_TXN_COL      = {"buy": "buys",    "sell": "sells",   "charge": "charges", "cash": "cashflow"}
+_TXN_DATE_COL = {"buy": "buyDate", "sell": "sellDate","charge": "chargeDate","cash": "date"}
+
+
+def _ensure_txn_cache(kind: str, from_str: str | None = None, to_str: str | None = None, batch: int = 20) -> None:
+    """Load first page + total count into session state if not already loaded."""
+    df_key       = f"txn_df_{kind}"
+    cursor_key   = f"txn_cursor_{kind}"
+    has_more_key = f"txn_has_more_{kind}"
+    total_key    = f"txn_total_{kind}"
+    col        = _TXN_COL[kind]
+    date_field = _TXN_DATE_COL[kind]
+    if df_key not in st.session_state:
+        if from_str and to_str:
+            fetch_range = {
+                "buy":    dm.fetch_buys_in_range,
+                "sell":   dm.fetch_sells_in_range,
+                "charge": dm.fetch_charges_in_range,
+                "cash":   dm.fetch_cashflow_in_range,
+            }[kind]
+            df, cursor = fetch_range(from_str, to_str, batch)
+            total = dm.count_in_range(col, date_field, from_str, to_str)
+        else:
+            fetch_page = {
+                "buy":    dm.fetch_buys_page,
+                "sell":   dm.fetch_sells_page,
+                "charge": dm.fetch_charges_page,
+                "cash":   dm.fetch_cashflow_page,
+            }[kind]
+            df, cursor = fetch_page(batch)
+            total = dm.count_collection(col)
+        st.session_state[df_key]       = df
+        st.session_state[cursor_key]   = cursor
+        st.session_state[has_more_key] = cursor is not None
+        st.session_state[total_key]    = total
+
+
 def page_transactions() -> None:
+    components.html(
+        "<script>window.parent.document.querySelector('[data-testid=\"stMain\"]').scrollTo(0, 0);</script>",
+        height=0,
+    )
     st.markdown('<h2 style="margin-top:0">🔄 Transactions & Reverse</h2>', unsafe_allow_html=True)
     st.caption(
         "Made a mistake in the app? Reverse any buy or sell here — the app will restore "
         "your holdings, cash, and investment trackers to the exact state before the action."
     )
 
-    tab_buys, tab_sells = st.tabs(["🟢 Buys", "🔴 Sells"])
+    # ── Date filter + page size ───────────────────────────────────────────────
+    if "txn_filter_gen" not in st.session_state:
+        st.session_state["txn_filter_gen"] = 0
+    _gen = st.session_state["txn_filter_gen"]
+
+    fc1, fc2, fc3, fc4 = st.columns([2, 2, 1, 1])
+    filter_from = fc1.date_input("From", value=None, key=f"txn_filter_from_{_gen}",
+                                 label_visibility="collapsed", help="Filter from date")
+    filter_to   = fc2.date_input("To",   value=None, key=f"txn_filter_to_{_gen}",
+                                 label_visibility="collapsed", help="Filter to date")
+    fc1.caption("From date")
+    fc2.caption("To date")
+
+    _TXN_PAGE_OPTIONS = [10, 20, 50, 100]
+    _txn_default = int(user.defaultPageSize) if int(user.defaultPageSize) in _TXN_PAGE_OPTIONS else _TXN_BATCH
+    txn_batch = fc4.selectbox("Page size", _TXN_PAGE_OPTIONS,
+                              index=_TXN_PAGE_OPTIONS.index(st.session_state.get("txn_batch", _txn_default)),
+                              key="txn_batch_sel", label_visibility="collapsed",
+                              help="Records per page")
+    fc4.caption("Page size")
+    if txn_batch != st.session_state.get("txn_batch", _txn_default):
+        st.session_state["txn_batch"] = txn_batch
+        for k in list(st.session_state.keys()):
+            if k.startswith("txn_df_") or k.startswith("txn_cursor_") \
+                    or k.startswith("txn_has_more_") or k.startswith("txn_total_"):
+                st.session_state.pop(k)
+        st.rerun()
+    txn_batch = st.session_state.get("txn_batch", _txn_default)
+
+    date_filter_active = filter_from is not None or filter_to is not None
+    if fc3.button("✕ Clear", key="txn_filter_clear", disabled=not date_filter_active, use_container_width=True):
+        st.session_state["txn_filter_gen"] += 1
+        # Also clear the txn cache so unfiltered data reloads fresh
+        for k in list(st.session_state.keys()):
+            if k.startswith("txn_df_") or k.startswith("txn_cursor_") \
+                    or k.startswith("txn_has_more_") or k.startswith("txn_total_") \
+                    or k == "txn_filter_key":
+                del st.session_state[k]
+        st.rerun()
+
+    if date_filter_active:
+        from_str = filter_from.isoformat() if filter_from else "1900-01-01"
+        to_str   = filter_to.isoformat()   if filter_to   else "2999-12-31"
+        filter_key = f"{from_str}_{to_str}"
+        # Reset filtered cache when the date range changes
+        if st.session_state.get("txn_filter_key") != filter_key:
+            for k in list(st.session_state.keys()):
+                if k.startswith("txn_df_") or k.startswith("txn_cursor_") \
+                        or k.startswith("txn_has_more_") or k.startswith("txn_total_"):
+                    del st.session_state[k]
+            st.session_state["txn_filter_key"] = filter_key
+    else:
+        from_str = to_str = filter_key = None
+        if st.session_state.get("txn_filter_key") is not None:
+            st.session_state.pop("txn_filter_key", None)
+            for k in list(st.session_state.keys()):
+                if k.startswith("txn_df_") or k.startswith("txn_cursor_") \
+                        or k.startswith("txn_has_more_") or k.startswith("txn_total_"):
+                    st.session_state.pop(k)
+
+    tab_buys, tab_sells, tab_charges, tab_cash = st.tabs(["🟢 Buys", "🔴 Sells", "🏦 Charges", "💰 Deposits & Withdrawals"])
 
     with tab_buys:
-        buys = dm.load_buys()
+        if date_filter_active:
+            _ensure_txn_cache("buy", from_str=from_str, to_str=to_str, batch=txn_batch)
+        else:
+            _ensure_txn_cache("buy", batch=txn_batch)
+        buys = st.session_state["txn_df_buy"]
         if buys.empty:
             st.info(
+                "No buy records found." if date_filter_active else
                 "No buy records yet. Buys made before this feature was added can't be reversed "
                 "through the log — use **Home → Sell** if you need to remove a legacy holding."
             )
         else:
-            _render_transaction_list(buys, kind="buy")
+            _render_transaction_list(buys, kind="buy", filtered=date_filter_active)
 
     with tab_sells:
-        sells = dm.load_sells()
-        if sells.empty:
-            st.info("No sell records yet.")
+        if date_filter_active:
+            _ensure_txn_cache("sell", from_str=from_str, to_str=to_str, batch=txn_batch)
         else:
-            _render_transaction_list(sells, kind="sell")
+            _ensure_txn_cache("sell", batch=txn_batch)
+        sells = st.session_state["txn_df_sell"]
+        if sells.empty:
+            st.info("No sell records found." if date_filter_active else "No sell records yet.")
+        else:
+            _render_transaction_list(sells, kind="sell", filtered=date_filter_active)
+
+    with tab_charges:
+        if date_filter_active:
+            _ensure_txn_cache("charge", from_str=from_str, to_str=to_str, batch=txn_batch)
+        else:
+            _ensure_txn_cache("charge", batch=txn_batch)
+        charges = st.session_state["txn_df_charge"]
+        if charges.empty:
+            st.info("No charge records found." if date_filter_active else "No charge records yet. Demat AMC will appear here once auto-deducted.")
+        else:
+            ch = charges.copy()
+            ch["_dt"] = pd.to_datetime(ch["chargeDate"], errors="coerce")
+            ch = ch.sort_values("_dt", ascending=False).reset_index(drop=True)
+            loaded_ch  = len(ch)
+            total_ch   = st.session_state.get("txn_total_charge", loaded_ch)
+            has_more_ch = st.session_state.get("txn_has_more_charge", False)
+            st.caption(f"Showing {loaded_ch} of {total_ch} charges (newest first)")
+            counts_ch = ch["_dt"].apply(
+                lambda dt: _chat_date_label(dt) if pd.notna(dt) else "Unknown date"
+            ).value_counts().to_dict()
+            last_label = None
+            for _, row in ch.iterrows():
+                dt = row["_dt"]
+                label = _chat_date_label(dt) if pd.notna(dt) else "Unknown date"
+                if label != last_label:
+                    n = counts_ch.get(label, 0)
+                    s = "charge" if n == 1 else "charges"
+                    _render_date_separator(f"{label} · {n} {s}")
+                    last_label = label
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([3, 1, 2])
+                    c1.markdown(
+                        f'**{row["description"]}**'
+                        f'<div class="text-muted" style="font-size:0.75rem;margin-top:2px">{row["chargeDate"]}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    c2.markdown(
+                        f'<div class="text-muted" style="font-size:0.72rem">TYPE</div>'
+                        f'<div>{row["chargeType"]}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    c3.markdown(
+                        f'<div class="text-muted" style="font-size:0.72rem">AMOUNT</div>'
+                        f'<div style="font-weight:600">−₹{float(row["amount"]):,.2f}</div>',
+                        unsafe_allow_html=True,
+                    )
+            st.caption(f"Total shown: **₹{ch['amount'].astype(float).sum():,.2f}**")
+            if has_more_ch:
+                rem_ch = total_ch - loaded_ch
+                nb_ch  = min(txn_batch, rem_ch)
+                if st.button(f"⬇ Load {nb_ch} more  ({loaded_ch} of {total_ch})", key="load_more_charge", use_container_width=True):
+                    cursor   = st.session_state.get("txn_cursor_charge")
+                    f_s = from_str if date_filter_active else None
+                    t_s = to_str   if date_filter_active else None
+                    if f_s and t_s:
+                        new_df, new_cursor = dm.fetch_charges_in_range(f_s, t_s, txn_batch, cursor)
+                    else:
+                        new_df, new_cursor = dm.fetch_charges_page(txn_batch, cursor)
+                    st.session_state["txn_df_charge"] = pd.concat(
+                        [st.session_state["txn_df_charge"], new_df], ignore_index=True
+                    )
+                    st.session_state["txn_cursor_charge"]   = new_cursor
+                    st.session_state["txn_has_more_charge"] = new_cursor is not None
+                    st.rerun()
+
+    with tab_cash:
+        if date_filter_active:
+            _ensure_txn_cache("cash", from_str=from_str, to_str=to_str, batch=txn_batch)
+        else:
+            _ensure_txn_cache("cash", batch=txn_batch)
+        cf = st.session_state["txn_df_cash"]
+        if cf.empty:
+            st.info("No records found." if date_filter_active else "No deposit or withdrawal history yet.")
+        else:
+            cf = cf.copy()
+            cf["_dt"] = pd.to_datetime(cf["date"], errors="coerce")
+            cf = cf.sort_values("_dt", ascending=False).reset_index(drop=True)
+            loaded_cf   = len(cf)
+            total_cf    = st.session_state.get("txn_total_cash", loaded_cf)
+            has_more_cf = st.session_state.get("txn_has_more_cash", False)
+
+            total_dep = cf[cf["type"] == "deposit"]["amount"].astype(float).sum()
+            total_wd  = cf[cf["type"] == "withdrawal"]["amount"].astype(float).sum()
+            net       = total_dep - total_wd
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("Total deposited", f"₹{total_dep:,.2f}")
+            mc2.metric("Total withdrawn",  f"₹{total_wd:,.2f}")
+            mc3.metric("Net invested",     f"₹{net:,.2f}")
+            if date_filter_active:
+                st.caption("Totals reflect the loaded records in the selected date range.")
+            st.markdown("---")
+            st.caption(f"Showing {loaded_cf} of {total_cf} entries (newest first)")
+
+            counts_cf = cf["_dt"].apply(
+                lambda dt: _chat_date_label(dt) if pd.notna(dt) else "Unknown date"
+            ).value_counts().to_dict()
+            last_label = None
+            for _, row in cf.iterrows():
+                dt = row["_dt"]
+                label = _chat_date_label(dt) if pd.notna(dt) else "Unknown date"
+                if label != last_label:
+                    n = counts_cf.get(label, 0)
+                    s = "transaction" if n == 1 else "transactions"
+                    _render_date_separator(f"{label} · {n} {s}")
+                    last_label = label
+                is_dep = str(row["type"]) == "deposit"
+                color  = "text-green" if is_dep else "text-red"
+                note   = str(row.get("note", "") or "").strip()
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([3, 1, 2])
+                    c1.markdown(
+                        f'**{"➕ Deposit" if is_dep else "➖ Withdrawal"}**'
+                        + (f'<div class="text-muted" style="font-size:0.75rem;margin-top:2px">{note}</div>' if note else "")
+                        + f'<div class="text-muted" style="font-size:0.75rem;margin-top:2px">{str(row["date"])}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    c2.markdown(
+                        f'<div class="text-muted" style="font-size:0.72rem">TYPE</div>'
+                        f'<div>{"Deposit" if is_dep else "Withdrawal"}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    c3.markdown(
+                        f'<div class="text-muted" style="font-size:0.72rem">AMOUNT</div>'
+                        f'<div class="{color}" style="font-weight:600">{"+" if is_dep else "−"}₹{float(row["amount"]):,.2f}</div>',
+                        unsafe_allow_html=True,
+                    )
+            if has_more_cf:
+                rem_cf = total_cf - loaded_cf
+                nb_cf  = min(txn_batch, rem_cf)
+                if st.button(f"⬇ Load {nb_cf} more  ({loaded_cf} of {total_cf})", key="load_more_cash", use_container_width=True):
+                    cursor   = st.session_state.get("txn_cursor_cash")
+                    f_s = from_str if date_filter_active else None
+                    t_s = to_str   if date_filter_active else None
+                    if f_s and t_s:
+                        new_df, new_cursor = dm.fetch_cashflow_in_range(f_s, t_s, txn_batch, cursor)
+                    else:
+                        new_df, new_cursor = dm.fetch_cashflow_page(txn_batch, cursor)
+                    st.session_state["txn_df_cash"] = pd.concat(
+                        [st.session_state["txn_df_cash"], new_df], ignore_index=True
+                    )
+                    st.session_state["txn_cursor_cash"]   = new_cursor
+                    st.session_state["txn_has_more_cash"] = new_cursor is not None
+                    st.rerun()
 
 
 def _chat_date_label(dt: datetime) -> str:
@@ -2133,24 +2831,34 @@ def _render_date_separator(label: str) -> None:
     )
 
 
-def _render_transaction_list(df: pd.DataFrame, kind: str) -> None:
+_TXN_BATCH = 20
+
+
+def _render_transaction_list(df: pd.DataFrame, kind: str, filtered: bool = False) -> None:
     date_col = "buyDate" if kind == "buy" else "sellDate"
     df = df.copy()
     df["_dt"] = pd.to_datetime(df[date_col], errors="coerce")
     df = df.sort_values("_dt", ascending=False, na_position="last").reset_index(drop=True)
-
     df["_label"] = df["_dt"].apply(
         lambda dt: _chat_date_label(dt) if pd.notna(dt) else "Unknown date"
     )
     counts = df["_label"].value_counts().to_dict()
+
+    loaded   = len(df)
+    total    = st.session_state.get(f"txn_total_{kind}", loaded)
+    has_more = st.session_state.get(f"txn_has_more_{kind}", False)
+    if filtered:
+        st.caption(f"{loaded} transactions in selected date range")
+    else:
+        st.caption(f"Showing {loaded} of {total} transactions (newest first)")
 
     last_label = None
     for _, row in df.iterrows():
         label = row["_label"]
         if label != last_label:
             n = counts.get(label, 0)
-            suffix = "transaction" if n == 1 else "transactions"
-            _render_date_separator(f"{label} · {n} {suffix}")
+            s = "transaction" if n == 1 else "transactions"
+            _render_date_separator(f"{label} · {n} {s}")
             last_label = label
 
         with st.container(border=True):
@@ -2206,11 +2914,30 @@ def _render_transaction_list(df: pd.DataFrame, kind: str) -> None:
                     unsafe_allow_html=True,
                 )
 
-            if st.button(
-                f"↩️ Reverse this {kind}",
-                key=f"rev_{kind}_{row['id']}",
-                use_container_width=True,
-            ):
+            if kind == "sell":
+                ec1, ec2 = st.columns(2)
+                edit_clicked = ec1.button("✏️ Edit price", key=f"edit_{row['id']}", use_container_width=True)
+                rev_clicked  = ec2.button("↩️ Reverse", key=f"rev_{kind}_{row['id']}", use_container_width=True)
+                if edit_clicked:
+                    _edit_sell_dialog(
+                        sell_id=str(row["id"]),
+                        name=str(row["etfName"]),
+                        qty=int(row["quantity"]),
+                        old_price=float(row["sellPrice"]),
+                    )
+            else:
+                ec1, ec2 = st.columns(2)
+                edit_clicked = ec1.button("✏️ Edit price", key=f"edit_{row['id']}", use_container_width=True)
+                rev_clicked  = ec2.button("↩️ Reverse", key=f"rev_{kind}_{row['id']}", use_container_width=True)
+                if edit_clicked:
+                    _edit_buy_dialog(
+                        buy_id=str(row["id"]),
+                        name=str(row["etfName"]),
+                        qty=int(row["quantity"]),
+                        old_price=float(row["price"]),
+                    )
+
+            if rev_clicked:
                 if kind == "buy":
                     summary = {
                         "value": float(row["price"]) * int(row["quantity"]),
@@ -2232,6 +2959,35 @@ def _render_transaction_list(df: pd.DataFrame, kind: str) -> None:
                     etf_type=str(row["etfType"]),
                     summary=summary,
                 )
+
+    if has_more:
+        remaining  = total - loaded
+        _batch     = st.session_state.get("txn_batch", _TXN_BATCH)
+        next_batch = min(_batch, remaining)
+        if st.button(f"⬇ Load {next_batch} more  ({loaded} of {total})", key=f"load_more_{kind}", use_container_width=True):
+            cursor   = st.session_state.get(f"txn_cursor_{kind}")
+            from_str = st.session_state.get("txn_filter_from")
+            to_str   = st.session_state.get("txn_filter_to")
+            f_str    = from_str.isoformat() if from_str else None
+            t_str    = to_str.isoformat()   if to_str   else None
+            if f_str or t_str:
+                f_str = f_str or "1900-01-01"
+                t_str = t_str or "2999-12-31"
+                if kind == "buy":
+                    new_df, new_cursor = dm.fetch_buys_in_range(f_str, t_str, _batch, cursor)
+                else:
+                    new_df, new_cursor = dm.fetch_sells_in_range(f_str, t_str, _batch, cursor)
+            else:
+                if kind == "buy":
+                    new_df, new_cursor = dm.fetch_buys_page(_batch, cursor)
+                else:
+                    new_df, new_cursor = dm.fetch_sells_page(_batch, cursor)
+            st.session_state[f"txn_df_{kind}"] = pd.concat(
+                [st.session_state[f"txn_df_{kind}"], new_df], ignore_index=True
+            )
+            st.session_state[f"txn_cursor_{kind}"]   = new_cursor
+            st.session_state[f"txn_has_more_{kind}"] = new_cursor is not None
+            st.rerun()
 
 
 def page_info() -> None:

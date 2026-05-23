@@ -5,19 +5,23 @@ Data is stored in **Firebase Firestore** — visible live at [console.firebase.g
 
 > **Other branches**
 > - `master` — original version, CSV file storage, no login
-> - `feature/firebase-firestore-csv` — flexible version supporting both Firebase and CSV backends
+> - `feature/firebase-firestore-csv` — hybrid version supporting both Firebase and CSV backends
 
 ---
 
 ## Features
 
-- Track ETF and stock holdings with average price, quantity, and P&L
+- **8-page app**: Home, Suggestions, Listed ETFs, Transactions, Sell History, Reports, Settings, Info
+- Track ETF and stock holdings with weighted-average price, quantity, and P&L
 - Log every buy and sell with automatic Kotak Securities charge calculation
-- Dashboard with portfolio summary, unrealised P&L, and type breakdown
-- Buy/sell suggestions based on 20-DMA dip threshold
-- Sell history with reversal support
-- Reports page — money flow, fees, month-wise breakdown
-- Password-protected login (single user)
+- Portfolio dashboard: allocation cards, 3-tab holdings filter, recent activity
+- Buy/sell suggestions based on 20-DMA dip — fresh picks + buyback candidates
+- Sell history with per-sell formula cards and reversal support
+- Transactions log: paginated buy / sell / charges / cashflow tabs with date filter
+- Reports: ledger reconciliation, fee breakdown, per-ETF flow, month-wise summary
+- Demat AMC auto-deduction every 30 days (logged to `charges` collection)
+- Deposit / withdrawal tracking with full cashflow history
+- Password-protected login — HMAC-SHA256 session tokens, 7-hour expiry
 
 ---
 
@@ -25,16 +29,17 @@ Data is stored in **Firebase Firestore** — visible live at [console.firebase.g
 
 ```
 FIRE/
-├── app.py                      # Streamlit UI — all pages and components
-├── data_manager.py             # Firebase read/write + all business logic
-├── migrate_to_firebase.py      # One-shot: imports CSV data into Firebase
-├── export_from_firebase.py     # Backup: exports Firebase data to CSV
+├── app.py                      # Streamlit UI — all 8 pages, auth, routing, components
+├── data_manager.py             # Firebase read/write + all business logic + charge calculations
+├── migrate_to_firebase.py      # One-shot: imports CSV data into Firestore
+├── export_from_firebase.py     # Backup: exports Firestore data to CSV
 ├── requirements.txt
 ├── firebase.json               # Firebase project config
 ├── .firebaserc                 # Bound to project: myfire-1783b
-├── firestore.rules             # Firestore security rules (permissive for dev)
-├── firestore.indexes.json      # Firestore composite indexes
+├── firestore.rules             # Firestore security rules
+├── firestore.indexes.json      # Composite indexes for pagination queries
 ├── serviceAccountKey.json      # ⚠️  LOCAL ONLY — gitignored, never commit
+├── DOCUMENTATION.html          # In-app docs — rendered on the ℹ️ Info page
 ├── .streamlit/
 │   ├── config.toml             # Streamlit theme config
 │   └── secrets.toml            # ⚠️  LOCAL ONLY — gitignored, never commit
@@ -53,11 +58,13 @@ FIRE/
 
 | Path | What it stores |
 |------|---------------|
-| `meta/user` | User settings — investment amount, remaining cash, thresholds |
-| `meta/config` | App password hash (SHA-256) |
+| `meta/user` | User settings — investment, remaining cash, thresholds, AMC config |
+| `meta/config` | App password hash (HMAC-SHA256 key) |
 | `holdings/{id}` | Open positions — one document per ETF/stock held |
-| `buys/{id}` | Buy transaction log — one document per buy |
-| `sells/{id}` | Sell transaction log — one document per sell |
+| `buys/{id}` | Buy transaction log — one document per buy event |
+| `sells/{id}` | Sell transaction log — one document per sell event |
+| `charges/{id}` | Non-trade charges — Demat AMC, DP fees, manual entries |
+| `cashflow/{id}` | Deposit / withdrawal log — every bank transfer in or out |
 
 ---
 
@@ -86,15 +93,7 @@ pip install -r requirements.txt
 
 > Gitignored — will never be committed to git.
 
-### 4. (Optional) Migrate existing CSV data
-
-If you have data in `./data/*.csv` from the old CSV version, import it once:
-
-```bash
-python migrate_to_firebase.py
-```
-
-### 5. Run the app
+### 4. Run the app
 
 ```bash
 streamlit run app.py
@@ -102,8 +101,8 @@ streamlit run app.py
 
 Opens at **http://localhost:8501**
 
-- **First launch** → prompted to create a password
-- **Every session after** → login screen before the app loads
+- **First launch** → prompted to create a password (stored as HMAC key in Firestore `meta/config`)
+- **Every session** → login screen → valid for 7 hours (token stored in URL query param `?s=...`)
 
 ---
 
@@ -136,8 +135,6 @@ client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/..."
 universe_domain = "googleapis.com"
 ```
 
-> Your `.streamlit/secrets.toml` already has all values filled in — just open and copy-paste.
-
 ### 3. Deploy
 
 Click **Deploy**. Credential resolution:
@@ -153,15 +150,13 @@ Click **Deploy**. Credential resolution:
 
 ### `migrate_to_firebase.py` — CSV → Firebase (run once)
 
-Imports your existing CSV data into Firestore. Safe to re-run — overwrites by document ID.
+Imports existing CSV data into Firestore. Safe to re-run — overwrites by document ID.
 
 ```bash
 python migrate_to_firebase.py
 ```
 
 Reads: `data/user.csv`, `data/holdings.csv`, `data/buys.csv`, `data/sells.csv`
-
----
 
 ### `export_from_firebase.py` — Firebase → CSV (backup anytime)
 
@@ -171,7 +166,7 @@ Downloads everything from Firestore back to local CSV files.
 python export_from_firebase.py
 ```
 
-Saves to `data/` folder. Useful as a backup or to switch back to the CSV version.
+Saves to `data/` folder.
 
 ---
 
@@ -185,12 +180,45 @@ Saves to `data/` folder. Useful as a backup or to switch back to the CSV version
 
 **Additional on every trade:** Exchange transaction 0.00297% · SEBI 0.0001% · Stamp duty 0.015% (buy only) · GST 18% on (brokerage + exchange + SEBI)
 
+**Not auto-computed — log manually via Settings → Add Manual Charge:**
+- DP charges: ₹27 min / ISIN / day (auto-deducted by Kotak on delivery sells)
+- Demat AMC: ₹18.88/month (₹16 + 18% GST) — the app auto-deducts this every 30 days
+
+---
+
+## Key Concepts
+
+### investment vs remainingAmount vs totalDeposited
+
+| Field | Meaning | Changes when |
+|-------|---------|-------------|
+| `totalDeposited` | Cumulative bank deposits — raw money added | Only on deposit / withdrawal |
+| `investment` | `totalDeposited + Σ net realized P&L` | On every sell (up on profit, down on loss) |
+| `remainingAmount` | Liquid cash right now | Decreases on buy + AMC; increases on sell proceeds |
+
+### Weighted average price on buy
+
+```
+new_avg = (old_avg × old_qty + price × qty) / (old_qty + qty)
+```
+
+Average price is not adjusted on partial sells — it stays until you buy more.
+
+### Realized P&L on sell
+
+```
+gross_pl = qty × (sell_price − avg_buy_price)
+net_pl   = gross_pl − brokerage − tax − dividend_paid_to_self
+```
+
+`investment` is updated by `+net_pl` on every sell.
+
 ---
 
 ## ETF Data Source
 
 Prices are fetched live from a **Google Apps Script API** and cached in `data/etfs_cache.csv`.  
-Click **Refresh ETFs** in the sidebar to pull fresh data anytime.
+Click **🔄 Refresh ETFs** in the sidebar to pull fresh data anytime.
 
 ---
 
@@ -199,10 +227,7 @@ Click **Refresh ETFs** in the sidebar to pull fresh data anytime.
 | File | Reason gitignored |
 |------|-------------------|
 | `serviceAccountKey.json` | Firebase private key — never commit |
-| `.streamlit/secrets.toml` | Same key in TOML format for Streamlit |
-| `data set/` | Personal watchlist spreadsheets |
-| `fire_mobile/` | Old mobile version |
-| `fire full/` | Old Flutter version |
+| `.streamlit/secrets.toml` | Same key in TOML format for Streamlit Cloud |
 
 ---
 
@@ -214,6 +239,5 @@ Click **Refresh ETFs** in the sidebar to pull fresh data anytime.
 | `firebase` | github.com/RavindraMedhat/FIRE_firebase | `feature/firebase-firestore` — this repo |
 
 ```bash
-# Push changes to this repo
 git push firebase feature/firebase-firestore
 ```

@@ -6,7 +6,7 @@ import math
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -58,6 +58,10 @@ USER_COLUMNS = [
     "dividendPercentage",
     "sellProfitTarget",
     "buyInDipThreshold",
+    "amcAmount",
+    "lastAmcDate",
+    "totalDeposited",
+    "defaultPageSize",
 ]
 
 # ---- Kotak Securities charges (Kotak Trade Plan, delivery, 2025) ----
@@ -132,6 +136,22 @@ BUY_COLUMNS = [
     "tax",
     "totalCharges",
     "buyDate",
+]
+
+CHARGE_COLUMNS = [
+    "id",
+    "chargeType",
+    "amount",
+    "description",
+    "chargeDate",
+]
+
+CASHFLOW_COLUMNS = [
+    "id",
+    "type",       # "deposit" | "withdrawal"
+    "amount",
+    "date",
+    "note",
 ]
 
 ETF_COLUMNS = [
@@ -213,6 +233,10 @@ class UserSettings:
     dividendPercentage: float = 0.0
     sellProfitTarget: float = 3.0
     buyInDipThreshold: float = 2.5
+    amcAmount: float = 18.88
+    lastAmcDate: str = ""
+    totalDeposited: float = 0.0
+    defaultPageSize: int = 20
 
 
 def load_user() -> UserSettings:
@@ -234,12 +258,142 @@ def load_user() -> UserSettings:
         dividendPercentage=float(row.get("dividendPercentage", 0) or 0),
         sellProfitTarget=float(row.get("sellProfitTarget", 3) or 3),
         buyInDipThreshold=float(row.get("buyInDipThreshold", 2.5) or 2.5),
+        amcAmount=float(row.get("amcAmount", 18.88) or 18.88),
+        lastAmcDate=str(row.get("lastAmcDate", "") or ""),
+        totalDeposited=float(row.get("totalDeposited", 0) or 0),
+        defaultPageSize=int(row.get("defaultPageSize", 20) or 20),
     )
 
 
 def save_user(u: UserSettings) -> None:
     data = {col: getattr(u, col) for col in USER_COLUMNS}
     db.collection("meta").document("user").set(data)
+
+
+def load_charges() -> pd.DataFrame:
+    return _collection_to_df("charges", CHARGE_COLUMNS)
+
+
+def fetch_charges_page(page_size: int, cursor=None) -> tuple[pd.DataFrame, object]:
+    q = db.collection("charges").order_by("chargeDate", direction=firestore.Query.DESCENDING)
+    if cursor is not None:
+        q = q.start_after(cursor)
+    docs = list(q.limit(page_size).stream())
+    if not docs:
+        return pd.DataFrame(columns=CHARGE_COLUMNS), None
+    rows = [d.to_dict() for d in docs]
+    df = pd.DataFrame(rows)
+    for col in CHARGE_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[CHARGE_COLUMNS], docs[-1]
+
+
+def fetch_charges_in_range(date_from: str, date_to: str, page_size: int = 20, cursor=None) -> tuple[pd.DataFrame, object]:
+    q = (
+        db.collection("charges")
+        .where("chargeDate", ">=", date_from)
+        .where("chargeDate", "<=", date_to)
+        .order_by("chargeDate", direction=firestore.Query.DESCENDING)
+    )
+    if cursor is not None:
+        q = q.start_after(cursor)
+    docs = list(q.limit(page_size).stream())
+    if not docs:
+        return pd.DataFrame(columns=CHARGE_COLUMNS), None
+    rows = [d.to_dict() for d in docs]
+    df = pd.DataFrame(rows)
+    for col in CHARGE_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[CHARGE_COLUMNS], docs[-1]
+
+
+def save_charge(charge_type: str, amount: float, description: str, charge_date: str | None = None) -> None:
+    row = {
+        "id": str(uuid.uuid4()),
+        "chargeType": charge_type,
+        "amount": amount,
+        "description": description,
+        "chargeDate": charge_date or _now_iso(),
+    }
+    db.collection("charges").document(row["id"]).set(row)
+
+
+def load_cashflow() -> pd.DataFrame:
+    return _collection_to_df("cashflow", CASHFLOW_COLUMNS)
+
+
+def fetch_cashflow_page(page_size: int, cursor=None) -> tuple[pd.DataFrame, object]:
+    q = db.collection("cashflow").order_by("date", direction=firestore.Query.DESCENDING)
+    if cursor is not None:
+        q = q.start_after(cursor)
+    docs = list(q.limit(page_size).stream())
+    if not docs:
+        return pd.DataFrame(columns=CASHFLOW_COLUMNS), None
+    rows = [d.to_dict() for d in docs]
+    df = pd.DataFrame(rows)
+    for col in CASHFLOW_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[CASHFLOW_COLUMNS], docs[-1]
+
+
+def fetch_cashflow_in_range(date_from: str, date_to: str, page_size: int = 20, cursor=None) -> tuple[pd.DataFrame, object]:
+    q = (
+        db.collection("cashflow")
+        .where("date", ">=", date_from)
+        .where("date", "<=", date_to)
+        .order_by("date", direction=firestore.Query.DESCENDING)
+    )
+    if cursor is not None:
+        q = q.start_after(cursor)
+    docs = list(q.limit(page_size).stream())
+    if not docs:
+        return pd.DataFrame(columns=CASHFLOW_COLUMNS), None
+    rows = [d.to_dict() for d in docs]
+    df = pd.DataFrame(rows)
+    for col in CASHFLOW_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[CASHFLOW_COLUMNS], docs[-1]
+
+
+def save_cashflow(txn_type: str, amount: float, txn_date: str | None = None, note: str = "") -> None:
+    row = {
+        "id": str(uuid.uuid4()),
+        "type": txn_type,
+        "amount": amount,
+        "date": txn_date or _now_iso()[:10],
+        "note": note,
+    }
+    db.collection("cashflow").document(row["id"]).set(row)
+
+
+def check_and_apply_amc(user: UserSettings) -> tuple[UserSettings, float]:
+    """Deduct monthly Demat AMC if 30+ days have passed since last deduction."""
+    if user.amcAmount <= 0:
+        return user, 0.0
+
+    today = date.today()
+
+    if not user.lastAmcDate:
+        # First run — record today as baseline without deducting
+        user.lastAmcDate = today.isoformat()
+        save_user(user)
+        return user, 0.0
+
+    last = date.fromisoformat(user.lastAmcDate)
+    if (today - last) < timedelta(days=30):
+        return user, 0.0
+
+    amount = user.amcAmount
+    user.investment -= amount
+    user.remainingAmount -= amount
+    user.lastAmcDate = today.isoformat()
+    save_user(user)
+    save_charge("AMC", amount, f"Demat AMC auto-deduction ({today.isoformat()})")
+    return user, amount
 
 
 # ── Holdings ──────────────────────────────────────────────────────────────────
@@ -258,6 +412,24 @@ def load_sells() -> pd.DataFrame:
     return _collection_to_df("sells", SELL_COLUMNS)
 
 
+def fetch_sells_page(page_size: int, cursor=None) -> tuple[pd.DataFrame, object]:
+    """Fetch one page of sells ordered newest-first.
+    Pass cursor=last_doc from a previous call to get the next page.
+    Returns (df, last_doc) — last_doc is None when no more records exist."""
+    q = db.collection("sells").order_by("sellDate", direction=firestore.Query.DESCENDING)
+    if cursor is not None:
+        q = q.start_after(cursor)
+    docs = list(q.limit(page_size).stream())
+    if not docs:
+        return pd.DataFrame(columns=SELL_COLUMNS), None
+    rows = [d.to_dict() for d in docs]
+    df = pd.DataFrame(rows)
+    for col in SELL_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[SELL_COLUMNS], docs[-1]
+
+
 def save_sells(df: pd.DataFrame) -> None:
     _replace_collection("sells", df[SELL_COLUMNS], "id")
 
@@ -268,8 +440,84 @@ def load_buys() -> pd.DataFrame:
     return _collection_to_df("buys", BUY_COLUMNS)
 
 
+def fetch_buys_page(page_size: int, cursor=None) -> tuple[pd.DataFrame, object]:
+    """Fetch one page of buys ordered newest-first.
+    Pass cursor=last_doc from a previous call to get the next page.
+    Returns (df, last_doc) — last_doc is None when no more records exist."""
+    q = db.collection("buys").order_by("buyDate", direction=firestore.Query.DESCENDING)
+    if cursor is not None:
+        q = q.start_after(cursor)
+    docs = list(q.limit(page_size).stream())
+    if not docs:
+        return pd.DataFrame(columns=BUY_COLUMNS), None
+    rows = [d.to_dict() for d in docs]
+    df = pd.DataFrame(rows)
+    for col in BUY_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[BUY_COLUMNS], docs[-1]
+
+
 def save_buys(df: pd.DataFrame) -> None:
     _replace_collection("buys", df[BUY_COLUMNS], "id")
+
+
+def count_collection(col_name: str) -> int:
+    result = db.collection(col_name).count().get()
+    return result[0][0].value
+
+
+def fetch_buys_in_range(date_from: str, date_to: str, page_size: int = 20, cursor=None) -> tuple[pd.DataFrame, object]:
+    """Fetch one page of buys in a date range, newest first. Returns (df, last_doc)."""
+    q = (
+        db.collection("buys")
+        .where("buyDate", ">=", date_from)
+        .where("buyDate", "<=", date_to)
+        .order_by("buyDate", direction=firestore.Query.DESCENDING)
+    )
+    if cursor is not None:
+        q = q.start_after(cursor)
+    docs = list(q.limit(page_size).stream())
+    if not docs:
+        return pd.DataFrame(columns=BUY_COLUMNS), None
+    rows = [d.to_dict() for d in docs]
+    df = pd.DataFrame(rows)
+    for col in BUY_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[BUY_COLUMNS], docs[-1]
+
+
+def fetch_sells_in_range(date_from: str, date_to: str, page_size: int = 20, cursor=None) -> tuple[pd.DataFrame, object]:
+    """Fetch one page of sells in a date range, newest first. Returns (df, last_doc)."""
+    q = (
+        db.collection("sells")
+        .where("sellDate", ">=", date_from)
+        .where("sellDate", "<=", date_to)
+        .order_by("sellDate", direction=firestore.Query.DESCENDING)
+    )
+    if cursor is not None:
+        q = q.start_after(cursor)
+    docs = list(q.limit(page_size).stream())
+    if not docs:
+        return pd.DataFrame(columns=SELL_COLUMNS), None
+    rows = [d.to_dict() for d in docs]
+    df = pd.DataFrame(rows)
+    for col in SELL_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[SELL_COLUMNS], docs[-1]
+
+
+def count_in_range(col_name: str, date_field: str, date_from: str, date_to: str) -> int:
+    result = (
+        db.collection(col_name)
+        .where(date_field, ">=", date_from)
+        .where(date_field, "<=", date_to)
+        .count()
+        .get()
+    )
+    return result[0][0].value
 
 
 def backfill_buys_from_holdings() -> int:
@@ -518,6 +766,76 @@ def sell_holding(
     save_user(user)
 
     return user, holdings, sells, charges
+
+
+def update_buy_price(user: UserSettings, buy_id: str, new_exec_value: float) -> UserSettings:
+    """Update buy price using exact execution value (price × qty, without charges).
+    Recalculates holding avg price and adjusts user balance."""
+    buys = load_buys()
+    row = buys[buys["id"] == buy_id]
+    if row.empty:
+        raise ValueError(f"Buy {buy_id} not found")
+    r = row.iloc[0]
+    qty        = int(r["quantity"])
+    etf_type   = str(r["etfType"])
+    etf_name   = str(r["etfName"])
+    holding_id = str(r["holdingId"])
+
+    old_price      = float(r["price"])
+    old_value      = old_price * qty
+    old_charges    = compute_kotak_charges(old_value, etf_type, side="buy")
+    old_total_cost = old_value + old_charges["total"]
+
+    new_price      = new_exec_value / qty
+    new_charges    = compute_kotak_charges(new_exec_value, etf_type, side="buy")
+    new_total_cost = new_exec_value + new_charges["total"]
+
+    # Update buy record
+    db.collection("buys").document(buy_id).update({
+        "price":            new_price,
+        "brokerageCharges": new_charges["brokerage"],
+        "tax":              new_charges["tax"],
+        "totalCharges":     new_charges["total"],
+    })
+
+    # Recalculate holding avg price from all buys for this ETF (weighted average)
+    buys.at[buys[buys["id"] == buy_id].index[0], "price"] = new_price
+    etf_buys = buys[buys["holdingId"] == holding_id]
+    if not etf_buys.empty:
+        total_val = (etf_buys["price"].astype(float) * etf_buys["quantity"].astype(int)).sum()
+        total_qty = etf_buys["quantity"].astype(int).sum()
+        new_avg = total_val / total_qty if total_qty > 0 else new_price
+        holdings = load_holdings()
+        hold_row = holdings[holdings["id"] == holding_id]
+        if not hold_row.empty:
+            holdings.at[hold_row.index[0], "averagePrice"] = new_avg
+            save_holdings(holdings)
+
+    # Adjust user balance by cost difference
+    diff = new_total_cost - old_total_cost
+    user.remainingAmount -= diff
+    save_user(user)
+    return user
+
+
+def update_sell_price(sell_id: str, kotak_total: float) -> dict:
+    """Update sellPrice + charges for a sell record using the exact Kotak total.
+    Does NOT adjust remainingAmount — call only when balance is already correct."""
+    sells = load_sells()
+    row = sells[sells["id"] == sell_id]
+    if row.empty:
+        raise ValueError(f"Sell {sell_id} not found")
+    r = row.iloc[0]
+    qty = int(r["quantity"])
+    etf_type = str(r["etfType"])
+    new_price = kotak_total / qty
+    charges = compute_kotak_charges(kotak_total, etf_type, side="sell")
+    db.collection("sells").document(sell_id).update({
+        "sellPrice":        new_price,
+        "brokerageCharges": charges["brokerage"],
+        "tax":              charges["tax"],
+    })
+    return {"newPrice": new_price, "charges": charges}
 
 
 def generate_suggestions(
@@ -951,14 +1269,17 @@ def compute_money_summary(
     unrealized_pl = current_value - cost_basis
 
     current_investment = float(user.investment)
-    initial_deposit = current_investment - sell_net_pl
+    # Display value: stored totalDeposited (real money you put in)
+    initial_deposit = float(user.totalDeposited) if user.totalDeposited > 0 else current_investment - sell_net_pl
+    # Reconciliation baseline: derived from investment (absorbs all historical adjustments)
+    reconcile_deposit = current_investment - sell_net_pl
     remaining_cash = float(user.remainingAmount)
 
     fees_paid_total = buy_total_charges + sell_fees_total
     money_consumed = fees_paid_total + sell_dividend
 
     account_balance = remaining_cash + cost_basis
-    expected_balance = initial_deposit + sell_gross_pl - money_consumed
+    expected_balance = reconcile_deposit + sell_gross_pl - money_consumed
     diff = account_balance - expected_balance
 
     return {

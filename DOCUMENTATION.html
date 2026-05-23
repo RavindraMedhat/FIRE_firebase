@@ -315,7 +315,7 @@
       <li><a href="#overview">1. What this app is</a></li>
       <li><a href="#stack">2. Tech stack</a></li>
       <li><a href="#structure">3. Project structure</a></li>
-      <li><a href="#data">4. Data model</a></li>
+      <li><a href="#data">4. Firestore data model</a></li>
       <li><a href="#concepts">5. Core concepts</a></li>
       <li><a href="#charges">6. Kotak charges</a></li>
       <li><a href="#flow">7. Application flow</a></li>
@@ -331,118 +331,178 @@
 
     <div class="hero">
       <h1>🔥 FIRE</h1>
-      <div class="tagline">Financial Independence, Retire Early — a local-only portfolio tracker for Kotak ETF &amp; stock investors.</div>
+      <div class="tagline">Financial Independence, Retire Early — a Firebase-backed portfolio tracker for Kotak ETF &amp; stock investors.</div>
       <div class="hero-pills">
         <span class="pill">Built with <b>Python + Streamlit</b></span>
-        <span class="pill"><b>CSV</b> storage</span>
-        <span class="pill">Single user</span>
+        <span class="pill"><b>Firebase Firestore</b> backend</span>
+        <span class="pill"><b>HMAC</b> session auth</span>
         <span class="pill">Live <b>Kotak</b> charges</span>
         <span class="pill"><b>20-DMA</b> based signals</span>
+        <span class="pill"><b>8 pages</b></span>
       </div>
     </div>
 
+    <!-- ══════════════════════════════════════════════════════════════════ -->
     <section id="overview">
       <h2><span class="emoji">📌</span> 1. What this app is</h2>
-      <p><strong>FIRE</strong> is a personal investment tracker for one user (you) — a Python port of a Flutter app — where everything is stored in local CSV files. No login, no database, no cloud.</p>
+      <p><strong>FIRE</strong> is a single-user investment tracker for Kotak Securities customers. All data lives in <strong>Firebase Firestore</strong>. Access is protected by an HMAC-SHA256 session token — one password, sessions last 7 hours.</p>
       <div class="grid-2">
         <div class="card">
           <h3 style="margin-top:0">What it does</h3>
           <ul>
             <li>Fetches <strong>live ETF market data</strong> from a Google Apps Script API</li>
-            <li>Tracks your <strong>current holdings</strong> &amp; <strong>sell history</strong></li>
-            <li>Recommends ETFs to buy (deepest dip vs 20-day moving average)</li>
-            <li>Flags holdings as 🟢 <em>Sell</em> or 🔴 <em>Buy-more</em> candidates</li>
-            <li>Auto-computes every <strong>Kotak charge</strong> on each trade</li>
-            <li>Generates realized P/L reports</li>
+            <li>Tracks current <strong>holdings, buy history, sell history</strong></li>
+            <li>Recommends ETFs to buy (deepest dip vs 20-DMA)</li>
+            <li>Flags holdings as 🟢 <em>Sell</em> or 🔴 <em>Buy more</em> candidates</li>
+            <li>Auto-computes every <strong>Kotak Securities charge</strong> per trade</li>
+            <li>Tracks <strong>Demat AMC</strong> charges monthly</li>
+            <li>Full <strong>ledger reconciliation</strong> in Reports page</li>
+            <li>Deposit / withdrawal / cashflow tracking</li>
           </ul>
         </div>
         <div class="card">
           <h3 style="margin-top:0">What it doesn't do</h3>
           <ul>
-            <li>No broker integration — you execute trades in the Kotak app and log them here</li>
+            <li>No broker integration — log trades manually after executing in Kotak app</li>
             <li>No multi-user support</li>
             <li>No tax-optimization advice</li>
-            <li>No push notifications / scheduling</li>
+            <li>No push notifications or scheduling</li>
+            <li>DP charges and STT on equity sells are <em>not yet</em> auto-tracked (logged separately via Charges tab)</li>
           </ul>
         </div>
       </div>
     </section>
 
+    <!-- ══════════════════════════════════════════════════════════════════ -->
     <section id="stack">
       <h2><span class="emoji">⚙️</span> 2. Tech stack</h2>
       <table>
-        <tr><th style="width:140px">Layer</th><th>Tech</th><th>Why</th></tr>
-        <tr><td>UI</td><td><code>Streamlit</code></td><td>Build a web app with pure Python, no HTML/JS</td></tr>
-        <tr><td>Data</td><td><code>pandas</code> + <code>CSV</code></td><td>Powerful tabular ops, human-readable files</td></tr>
-        <tr><td>HTTP</td><td><code>requests</code></td><td>Hit the ETF API</td></tr>
-        <tr><td>Runtime</td><td>Python 3.8+</td><td>Available everywhere</td></tr>
+        <tr><th style="width:160px">Layer</th><th>Tech</th><th>Why</th></tr>
+        <tr><td>UI</td><td><code>Streamlit</code></td><td>Web app in pure Python — no frontend framework needed</td></tr>
+        <tr><td>Database</td><td><code>Firebase Firestore</code></td><td>Cloud NoSQL — works from both local dev and Streamlit Cloud</td></tr>
+        <tr><td>Firebase SDK</td><td><code>firebase-admin</code></td><td>Server-side Firestore access with service account credentials</td></tr>
+        <tr><td>Data</td><td><code>pandas</code></td><td>Tabular operations on query results</td></tr>
+        <tr><td>HTTP</td><td><code>requests</code></td><td>Fetch live ETF data from the Google Apps Script API</td></tr>
+        <tr><td>Auth</td><td><code>hmac + hashlib</code></td><td>HMAC-SHA256 signed session tokens stored in URL query param</td></tr>
+        <tr><td>Runtime</td><td>Python 3.8+</td><td>Available everywhere; Streamlit Cloud compatible</td></tr>
       </table>
     </section>
 
+    <!-- ══════════════════════════════════════════════════════════════════ -->
     <section id="structure">
       <h2><span class="emoji">📁</span> 3. Project structure</h2>
       <div class="tree">
-<span class="dir">python_version/</span>
-├── <span class="file">app.py</span><span class="cmt"># Streamlit UI — 6 pages + routing</span>
-├── <span class="file">data_manager.py</span><span class="cmt"># Business logic, CSV I/O, Kotak charges</span>
+<span class="dir">FIRE/</span>
+├── <span class="file">app.py</span><span class="cmt"># Streamlit UI — 8 pages, auth, routing, all components</span>
+├── <span class="file">data_manager.py</span><span class="cmt"># Firebase read/write + all business logic + charge calculations</span>
 ├── <span class="file">requirements.txt</span><span class="cmt"># pip dependencies</span>
-├── <span class="file">README.md</span><span class="cmt"># Quick start</span>
-├── <span class="file">DOCUMENTATION.html</span><span class="cmt"># ← you are here</span>
+├── <span class="file">README.md</span><span class="cmt"># Quick start + setup guide</span>
+├── <span class="file">DOCUMENTATION.html</span><span class="cmt"># ← you are here — rendered on the Info page</span>
+├── <span class="file">migrate_to_firebase.py</span><span class="cmt"># One-shot: imports CSV data into Firestore</span>
+├── <span class="file">export_from_firebase.py</span><span class="cmt"># Backup: exports Firestore data to local CSV</span>
+├── <span class="file">firebase.json</span><span class="cmt"># Firebase project config</span>
+├── <span class="file">firestore.rules</span><span class="cmt"># Firestore security rules</span>
+├── <span class="file">firestore.indexes.json</span><span class="cmt"># Composite indexes for pagination queries</span>
+├── <span class="file">serviceAccountKey.json</span><span class="cmt"># ⚠ LOCAL ONLY — gitignored, never commit</span>
 ├── <span class="dir">.streamlit/</span>
-│   └── <span class="file">config.toml</span><span class="cmt"># Dark theme + server config</span>
-└── <span class="dir">data/</span><span class="cmt"># Auto-created</span>
-    ├── <span class="file">user.csv</span><span class="cmt"># Profile + settings (single row)</span>
-    ├── <span class="file">holdings.csv</span><span class="cmt"># Current holdings</span>
-    ├── <span class="file">sells.csv</span><span class="cmt"># Sell history</span>
-    └── <span class="file">etfs_cache.csv</span><span class="cmt"># Last-fetched ETF data</span>
+│   ├── <span class="file">config.toml</span><span class="cmt"># Dark theme + server config</span>
+│   └── <span class="file">secrets.toml</span><span class="cmt"># ⚠ LOCAL ONLY — Firebase service account as TOML</span>
+└── <span class="dir">data/</span>
+    └── <span class="file">etfs_cache.csv</span><span class="cmt"># Live ETF price cache (local, auto-refreshed)</span>
       </div>
+
+      <h3>Firestore collections</h3>
+      <table>
+        <tr><th>Path</th><th>What it stores</th></tr>
+        <tr><td><code>meta/user</code></td><td>User profile + settings — investment, remaining cash, thresholds, AMC config</td></tr>
+        <tr><td><code>meta/config</code></td><td>App password hash (HMAC-SHA256 key)</td></tr>
+        <tr><td><code>holdings/{id}</code></td><td>Open positions — one document per ETF / stock currently held</td></tr>
+        <tr><td><code>buys/{id}</code></td><td>Full buy transaction log — one document per buy event</td></tr>
+        <tr><td><code>sells/{id}</code></td><td>Full sell transaction log — one document per sell event</td></tr>
+        <tr><td><code>charges/{id}</code></td><td>Non-trade charges — Demat AMC, DP fees, any manual charge entries</td></tr>
+        <tr><td><code>cashflow/{id}</code></td><td>Deposit / withdrawal log — every bank transfer in or out</td></tr>
+      </table>
     </section>
 
+    <!-- ══════════════════════════════════════════════════════════════════ -->
     <section id="data">
-      <h2><span class="emoji">🗂️</span> 4. Data model</h2>
+      <h2><span class="emoji">🗂️</span> 4. Firestore data model</h2>
 
-      <h3>user.csv <span style="font-size:0.85rem;color:var(--muted);font-weight:400">— one row</span></h3>
+      <h3>meta/user — UserSettings</h3>
       <table>
-        <tr><th>Column</th><th>Type</th><th>Meaning</th></tr>
-        <tr><td><code>userName</code></td><td>str</td><td>Your name</td></tr>
-        <tr><td><code>investment</code></td><td>float</td><td>Running net capital (adjusts on each sell)</td></tr>
-        <tr><td><code>remainingAmount</code></td><td>float</td><td>Cash available to invest</td></tr>
-        <tr><td><code>taxPercentage</code></td><td>float</td><td><span class="badge b-red">legacy</span> auto-computed per trade</td></tr>
-        <tr><td><code>brokeragePercentage</code></td><td>float</td><td><span class="badge b-red">legacy</span> auto-computed per trade</td></tr>
-        <tr><td><code>dividendPercentage</code></td><td>float</td><td>% of each sell kept as "pay to self"</td></tr>
-        <tr><td><code>sellProfitTarget</code></td><td>float</td><td>Sell-signal threshold (default 3%)</td></tr>
-        <tr><td><code>buyInDipThreshold</code></td><td>float</td><td>Buy-more threshold (default 2.5%)</td></tr>
+        <tr><th>Field</th><th>Type</th><th>Meaning</th></tr>
+        <tr><td><code>userName</code></td><td>str</td><td>Your display name</td></tr>
+        <tr><td><code>investment</code></td><td>float</td><td>Running net capital: <code>totalDeposited + Σ realized net P&amp;L</code>. Increases on profitable sells, decreases on losses.</td></tr>
+        <tr><td><code>remainingAmount</code></td><td>float</td><td>Liquid cash available — decreases on buy/AMC, increases on sell proceeds</td></tr>
+        <tr><td><code>totalDeposited</code></td><td>float</td><td>Cumulative bank deposits — never changes on trades</td></tr>
+        <tr><td><code>taxPercentage</code></td><td>float</td><td>Legacy field — actual tax is auto-computed per trade</td></tr>
+        <tr><td><code>brokeragePercentage</code></td><td>float</td><td>Legacy field — actual brokerage is auto-computed per trade</td></tr>
+        <tr><td><code>dividendPercentage</code></td><td>float</td><td>% of each sell profit kept as "pay to self" (default 0)</td></tr>
+        <tr><td><code>sellProfitTarget</code></td><td>float</td><td>Sell-signal threshold % (default 3%)</td></tr>
+        <tr><td><code>buyInDipThreshold</code></td><td>float</td><td>Buy-more-signal threshold % (default 2.5%)</td></tr>
+        <tr><td><code>amcAmount</code></td><td>float</td><td>Monthly Demat AMC amount (₹18.88 = ₹16 + 18% GST)</td></tr>
+        <tr><td><code>lastAmcDate</code></td><td>str (ISO)</td><td>Date AMC was last auto-deducted — triggers deduction every 30 days</td></tr>
+        <tr><td><code>defaultPageSize</code></td><td>int</td><td>Rows per page in paginated tables (default 20)</td></tr>
       </table>
 
-      <h3>holdings.csv <span style="font-size:0.85rem;color:var(--muted);font-weight:400">— one row per holding</span></h3>
+      <h3>holdings/{id}</h3>
       <table>
-        <tr><th>Column</th><th>Type</th><th>Meaning</th></tr>
-        <tr><td><code>id</code></td><td>uuid</td><td>Unique holding id</td></tr>
-        <tr><td><code>etfName</code></td><td>str</td><td>Name (matches ETF API)</td></tr>
+        <tr><th>Field</th><th>Type</th><th>Meaning</th></tr>
+        <tr><td><code>id</code></td><td>uuid</td><td>Document ID (also stored as field)</td></tr>
+        <tr><td><code>etfName</code></td><td>str</td><td>Name matching the ETF API (used for live price lookup)</td></tr>
         <tr><td><code>etfType</code></td><td>str</td><td><span class="badge b-equity">Equity</span><span class="badge b-jewellery">Jewellery</span><span class="badge b-stocks">Stocks</span></td></tr>
-        <tr><td><code>averagePrice</code></td><td>float</td><td>Weighted average buy price</td></tr>
-        <tr><td><code>lastPurchasePrice</code></td><td>float</td><td>Price of most recent buy</td></tr>
-        <tr><td><code>totalQuantity</code></td><td>int</td><td>Units held</td></tr>
-        <tr><td><code>lastPurchaseDate</code></td><td>iso str</td><td>Date of last buy</td></tr>
+        <tr><td><code>averagePrice</code></td><td>float</td><td>Weighted average buy price — updated on every new buy</td></tr>
+        <tr><td><code>lastPurchasePrice</code></td><td>float</td><td>Price paid on the most recent buy</td></tr>
+        <tr><td><code>totalQuantity</code></td><td>int</td><td>Units currently held</td></tr>
+        <tr><td><code>lastPurchaseDate</code></td><td>str (ISO)</td><td>Timestamp of the most recent buy</td></tr>
       </table>
 
-      <h3>sells.csv <span style="font-size:0.85rem;color:var(--muted);font-weight:400">— one row per sell transaction</span></h3>
+      <h3>buys/{id}</h3>
       <table>
-        <tr><th>Column</th><th>Meaning</th></tr>
+        <tr><th>Field</th><th>Meaning</th></tr>
         <tr><td><code>id, etfName, etfType</code></td><td>Identifier fields</td></tr>
-        <tr><td><code>quantity, averagePurchasePrice, sellPrice</code></td><td>Trade details</td></tr>
-        <tr><td><code>brokerageCharges</code></td><td>Kotak brokerage paid</td></tr>
+        <tr><td><code>quantity, price</code></td><td>Units bought and price per unit</td></tr>
+        <tr><td><code>brokerageCharges</code></td><td>Kotak brokerage paid on this buy</td></tr>
+        <tr><td><code>tax</code></td><td>STT + exchange + SEBI + stamp duty + GST (bundled as "tax")</td></tr>
+        <tr><td><code>buyDate</code></td><td>ISO timestamp of the buy</td></tr>
+      </table>
+
+      <h3>sells/{id}</h3>
+      <table>
+        <tr><th>Field</th><th>Meaning</th></tr>
+        <tr><td><code>id, etfName, etfType</code></td><td>Identifier fields</td></tr>
+        <tr><td><code>quantity, averagePurchasePrice, sellPrice</code></td><td>Trade details — avg is at time of sell</td></tr>
+        <tr><td><code>brokerageCharges</code></td><td>Kotak brokerage paid on this sell</td></tr>
         <tr><td><code>tax</code></td><td>STT + exchange + SEBI + GST bundled</td></tr>
-        <tr><td><code>dividendPaidToSelf</code></td><td>Personal savings cut</td></tr>
+        <tr><td><code>dividendPaidToSelf</code></td><td>Personal savings cut from this sell</td></tr>
         <tr><td><code>lastPurchaseDate, sellDate</code></td><td>ISO timestamps</td></tr>
       </table>
 
-      <h3>etfs_cache.csv <span style="font-size:0.85rem;color:var(--muted);font-weight:400">— market data</span></h3>
-      <p>Mirrors the Google Apps Script API response:
-      <code>etfCode, name, cmp, the20Dma, change20DmaVsCmp, changePercentage,
-      dailyAverageVolumeInLast30/90/365Days, type</code>. Refreshed on app open &amp; via the 🔄 button.</p>
+      <h3>charges/{id}</h3>
+      <table>
+        <tr><th>Field</th><th>Meaning</th></tr>
+        <tr><td><code>id</code></td><td>UUID document ID</td></tr>
+        <tr><td><code>description</code></td><td>Human-readable label (e.g. "Demat AMC May 2026")</td></tr>
+        <tr><td><code>amount</code></td><td>Rupee amount deducted</td></tr>
+        <tr><td><code>date</code></td><td>ISO timestamp of the charge</td></tr>
+      </table>
+
+      <h3>cashflow/{id}</h3>
+      <table>
+        <tr><th>Field</th><th>Meaning</th></tr>
+        <tr><td><code>id</code></td><td>UUID document ID</td></tr>
+        <tr><td><code>type</code></td><td><code>"deposit"</code> or <code>"withdrawal"</code></td></tr>
+        <tr><td><code>amount</code></td><td>Rupee amount</td></tr>
+        <tr><td><code>note</code></td><td>Optional description</td></tr>
+        <tr><td><code>date</code></td><td>ISO timestamp</td></tr>
+      </table>
+
+      <div class="callout info">
+        <b>Single source of truth:</b> Firestore is always authoritative. Local <code>data/*.csv</code> files are stale backups — never use them for reconciliation.
+      </div>
     </section>
 
+    <!-- ══════════════════════════════════════════════════════════════════ -->
     <section id="concepts">
       <h2><span class="emoji">💡</span> 5. Core concepts</h2>
 
@@ -450,125 +510,176 @@
       <div class="grid-3">
         <div class="card" style="border-color: rgba(96,165,250,0.3)">
           <span class="badge b-equity">Equity</span>
-          <p style="margin-top:10px">Broad-market ETFs — Nifty, Sensex variants.</p>
+          <p style="margin-top:10px">Broad-market ETFs — Nifty, Bank Nifty, Pharma, IT, Realty, PSU variants.</p>
         </div>
         <div class="card" style="border-color: rgba(251,191,36,0.3)">
           <span class="badge b-jewellery">Jewellery</span>
-          <p style="margin-top:10px">Gold / Silver ETFs.</p>
+          <p style="margin-top:10px">Gold &amp; Silver ETFs — HDFC Gold, SBI Gold, Nippon Silver, etc.</p>
         </div>
         <div class="card" style="border-color: rgba(192,132,252,0.3)">
           <span class="badge b-stocks">Stocks</span>
-          <p style="margin-top:10px">Direct equity — Reliance, Bajaj Finance, etc.</p>
+          <p style="margin-top:10px">Direct equity — Reliance, Bharti Airtel, and other individual stocks.</p>
         </div>
       </div>
 
-      <h3>Buy / Sell signals (Home page)</h3>
+      <h3>investment vs remainingAmount vs totalDeposited</h3>
+      <table>
+        <tr><th>Field</th><th>What it means</th><th>Changes when</th></tr>
+        <tr>
+          <td><code>totalDeposited</code></td>
+          <td>Cumulative bank deposits — the raw money you put in</td>
+          <td>Only on deposit / withdrawal via Settings</td>
+        </tr>
+        <tr>
+          <td><code>investment</code></td>
+          <td><code>totalDeposited + Σ net realized P&amp;L</code> — your effective buying power after all sells</td>
+          <td>On every sell: increases by profit, decreases by loss</td>
+        </tr>
+        <tr>
+          <td><code>remainingAmount</code></td>
+          <td>Liquid cash right now — what you can spend on the next buy</td>
+          <td>Decreases on buy + AMC; increases on sell proceeds</td>
+        </tr>
+      </table>
+
+      <h3>Buy / Sell signals (Home page tabs)</h3>
       <table>
         <tr><th>Tab</th><th>Condition</th><th>Meaning</th></tr>
         <tr>
           <td><span class="badge b-green">🟢 Sell</span></td>
-          <td><code>CMP &gt; avgPrice × (1 + sellProfitTarget%)</code></td>
-          <td>In profit — consider selling</td>
+          <td><code>CMP &gt; avgPrice × (1 + sellProfitTarget / 100)</code></td>
+          <td>Holding is in profit — consider selling</td>
         </tr>
         <tr>
           <td><span class="badge b-red">🔴 Buy more</span></td>
-          <td><code>CMP &lt; avgPrice × (1 − buyInDipThreshold%)</code></td>
-          <td>In dip — consider averaging down</td>
+          <td><code>CMP &lt; avgPrice × (1 − buyInDipThreshold / 100)</code></td>
+          <td>Holding is in a dip — consider averaging down</td>
         </tr>
         <tr>
-          <td>⚪ Others</td>
-          <td>neither</td>
-          <td>Hold</td>
+          <td>📋 All Holdings</td>
+          <td>all holdings regardless of signal</td>
+          <td>Default view; sorted by |P/L %| descending</td>
         </tr>
       </table>
 
-      <h3>Suggestion algorithm</h3>
+      <h3>Suggestion algorithm (💡 Suggestions page)</h3>
       <div class="callout info">
-        <b>Goal:</b> pick <em>one ETF per asset type</em> with the deepest dip vs 20-DMA — and don't suggest things you already hold.
+        <b>Goal:</b> pick <em>one ETF per asset type</em> with the deepest dip vs 20-DMA that you don't already hold.
       </div>
       <pre><code>1. Group all ETFs by type: Equity, Jewellery, Stocks
-2. Sort each group ascending by change20DmaVsCmp   (= biggest dip first)
-3. Take top 5 from Equity, top 3 from Jewellery, top 3 from Stocks
+2. Sort each group ascending by change20DmaVsCmp   (biggest dip first)
+3. Take top 5 Equity + top 3 Jewellery + top 3 Stocks candidates
 4. Remove any ETF already in holdings
-5. For each type, pick the one with the greatest dip
-6. Suggested quantity  =  ceil(investment / 25 / CMP)</code></pre>
-      <p style="color:var(--muted);font-size:0.88rem">The <code>/25</code> divisor is the original app's allocation heuristic — roughly 4% of total investment per pick.</p>
+5. Pick the top-dip ETF from each type → "Fresh picks"
+6. Also show ETFs already held that are in the deepest dip → "Buyback" candidates
+7. Suggested quantity = ceil(investment / 25 / CMP)   (~4% allocation heuristic)</code></pre>
+
+      <h3>Weighted average price (on buy)</h3>
+      <pre><code>new_avg = (old_avg × old_qty + price × qty) / (old_qty + qty)</code></pre>
+      <p>Average price is <strong>not</strong> adjusted when you partially sell — it stays at the last buy-weighted average until you buy more.</p>
+
+      <h3>Realized P&amp;L on sell</h3>
+      <pre><code>gross_pl   = qty × (sell_price − avg_buy_price)
+net_pl     = gross_pl − brokerage − tax − dividend_paid_to_self</code></pre>
+      <p>The <code>investment</code> field is updated by <code>+net_pl</code> on every sell.</p>
+
+      <h3>Demat AMC auto-deduction</h3>
+      <p>Every time the app starts, if <code>today − lastAmcDate ≥ 30 days</code>, the configured <code>amcAmount</code> (default ₹18.88 = ₹16 + 18% GST) is automatically deducted from both <code>investment</code> and <code>remainingAmount</code>, a record is written to the <code>charges</code> collection, and <code>lastAmcDate</code> is updated.</p>
     </section>
 
+    <!-- ══════════════════════════════════════════════════════════════════ -->
     <section id="charges">
       <h2><span class="emoji">💰</span> 6. Kotak charges (auto-applied)</h2>
-      <p>From the Kotak Trade Plan tariff + standard 2025 statutory rates. All applied via <code>data_manager.compute_kotak_charges(value, etf_type, side)</code>.</p>
+      <p>All charges are computed by <code>data_manager.compute_kotak_charges(value, etf_type, side)</code> using the Kotak Trade Plan tariff and 2025 statutory rates.</p>
 
       <h3>Brokerage</h3>
       <div class="grid-2">
-        <div class="rate"><div class="label">ETFs (Equity / Jewellery)</div><div class="val">0.05%</div><div class="sub">delivery, both buy &amp; sell</div></div>
-        <div class="rate"><div class="label">Stocks</div><div class="val">0.10%</div><div class="sub">delivery, both buy &amp; sell</div></div>
+        <div class="rate"><div class="label">ETFs (Equity / Jewellery)</div><div class="val">0.05%</div><div class="sub">delivery, buy &amp; sell</div></div>
+        <div class="rate"><div class="label">Stocks</div><div class="val">0.10%</div><div class="sub">delivery, buy &amp; sell</div></div>
       </div>
 
       <h3>Securities Transaction Tax (STT)</h3>
       <div class="grid-2">
-        <div class="rate"><div class="label">ETFs</div><div class="val">0.001%</div><div class="sub">sell-side only</div></div>
-        <div class="rate"><div class="label">Stocks</div><div class="val">0.10%</div><div class="sub">both buy &amp; sell</div></div>
+        <div class="rate"><div class="label">ETFs — sell only</div><div class="val">0.001%</div><div class="sub">no STT on ETF buys</div></div>
+        <div class="rate"><div class="label">Stocks — buy &amp; sell</div><div class="val">0.10%</div><div class="sub">both sides</div></div>
       </div>
 
-      <h3>Other statutory (every trade)</h3>
+      <h3>Other statutory charges (every trade)</h3>
       <div class="grid-4">
-        <div class="rate"><div class="label">Stamp Duty</div><div class="val">0.015%</div><div class="sub">buy only</div></div>
-        <div class="rate"><div class="label">Exchange</div><div class="val">0.00297%</div><div class="sub">NSE equity</div></div>
+        <div class="rate"><div class="label">Stamp Duty</div><div class="val">0.015%</div><div class="sub">buy side only</div></div>
+        <div class="rate"><div class="label">Exchange (NSE)</div><div class="val">0.00297%</div><div class="sub">both sides</div></div>
         <div class="rate"><div class="label">SEBI</div><div class="val">0.0001%</div><div class="sub">₹10/crore</div></div>
-        <div class="rate"><div class="label">GST</div><div class="val">18%</div><div class="sub">on brokerage+exch+sebi</div></div>
+        <div class="rate"><div class="label">GST</div><div class="val">18%</div><div class="sub">on brokerage + exchange + SEBI</div></div>
       </div>
 
-      <h3>Example — Buy 10 units of an ETF @ ₹50 (trade value ₹500)</h3>
+      <h3>Charges not auto-computed (log manually via Settings → Charges tab)</h3>
+      <div class="grid-2">
+        <div class="rate"><div class="label">DP Charges</div><div class="val">₹27 min / ISIN / day</div><div class="sub">on delivery sells — auto-deducted by Kotak</div></div>
+        <div class="rate"><div class="label">Demat AMC</div><div class="val">₹18.88 / month</div><div class="sub">₹16 + 18% GST — auto-deducted from app every 30 days</div></div>
+      </div>
+
+      <h3>Example — Buy 10 units of an Equity ETF @ ₹50 (trade value ₹500)</h3>
       <table>
         <tr><th>Component</th><th>Calculation</th><th style="text-align:right">Amount</th></tr>
         <tr><td>Brokerage</td><td>500 × 0.05%</td><td style="text-align:right">₹ 0.2500</td></tr>
-        <tr><td>STT</td><td>0 (buy, ETF)</td><td style="text-align:right">₹ 0.0000</td></tr>
+        <tr><td>STT</td><td>0 (buy side, ETF)</td><td style="text-align:right">₹ 0.0000</td></tr>
         <tr><td>Stamp duty</td><td>500 × 0.015%</td><td style="text-align:right">₹ 0.0750</td></tr>
         <tr><td>Exchange</td><td>500 × 0.00297%</td><td style="text-align:right">₹ 0.0149</td></tr>
         <tr><td>SEBI</td><td>500 × 0.0001%</td><td style="text-align:right">₹ 0.0005</td></tr>
         <tr><td>GST</td><td>18% × (0.25 + 0.0149 + 0.0005)</td><td style="text-align:right">₹ 0.0478</td></tr>
         <tr style="background:rgba(255,107,53,0.08)"><td><strong>Total charges</strong></td><td></td><td style="text-align:right"><strong>₹ 0.3881</strong></td></tr>
       </table>
+      <p>On a <em>sell</em>, the same brokerage + statutory rates apply, with STT now 0.001% of the sell value (for ETFs) or 0.10% (for Stocks).</p>
     </section>
 
+    <!-- ══════════════════════════════════════════════════════════════════ -->
     <section id="flow">
       <h2><span class="emoji">🔄</span> 7. Application flow</h2>
 
-      <h3>App startup</h3>
+      <h3>App startup &amp; authentication</h3>
       <div class="flow">
-        <div class="flow-box accent"><div class="title">streamlit run app.py</div></div>
+        <div class="flow-box accent"><div class="title">Browser opens app URL</div></div>
         <div class="arrow">↓</div>
-        <div class="flow-box"><div class="title">ensure_state()</div><div class="sub">session bootstrap</div></div>
+        <div class="flow-box"><div class="title">Check URL query param <code>?s=&lt;token&gt;</code></div><div class="sub">HMAC-SHA256 signed, 7-hour expiry</div></div>
         <div class="arrow">↓</div>
-        <div class="flow-box"><div class="title">Load user.csv</div><div class="sub">→ session.user</div></div>
+        <div class="flow-box"><div class="title">Valid token?</div><div class="sub">Yes → proceed · No / expired → show login screen</div></div>
         <div class="arrow">↓</div>
-        <div class="flow-box"><div class="title">Fetch live ETFs from API</div><div class="sub">fallback to etfs_cache.csv on error</div></div>
+        <div class="flow-box"><div class="title">Load user settings from Firestore <code>meta/user</code></div></div>
         <div class="arrow">↓</div>
-        <div class="flow-box"><div class="title">generate_suggestions()</div><div class="sub">→ session.suggestions</div></div>
+        <div class="flow-box"><div class="title">Check AMC due date</div><div class="sub">If lastAmcDate + 30 days ≤ today → deduct AMC, write to charges</div></div>
+        <div class="arrow">↓</div>
+        <div class="flow-box"><div class="title">Fetch live ETFs from API → cache to etfs_cache.csv</div></div>
+        <div class="arrow">↓</div>
+        <div class="flow-box"><div class="title">generate_suggestions()</div><div class="sub">stored in session state</div></div>
         <div class="arrow">↓</div>
         <div class="flow-box accent"><div class="title">Render sidebar + selected page</div></div>
       </div>
 
       <h3>Buy flow</h3>
       <div class="flow">
-        <div class="flow-box"><div class="title">User clicks Buy</div><div class="sub">on Suggestion or Home "Buy more"</div></div>
+        <div class="flow-box"><div class="title">User opens buy dialog</div><div class="sub">from Suggestion card or holding "Buy more" button</div></div>
         <div class="arrow">↓</div>
-        <div class="flow-box"><div class="title">Enter price + quantity</div></div>
+        <div class="flow-box"><div class="title">Enter price + quantity</div><div class="sub">Itemized Kotak charge breakdown shown live</div></div>
         <div class="arrow">↓</div>
-        <div class="flow-box"><div class="title">compute_kotak_charges(value, type, "buy")</div><div class="sub">itemized breakdown shown in UI</div></div>
+        <div class="flow-box"><div class="title">compute_kotak_charges(value, type, "buy")</div></div>
         <div class="arrow">↓</div>
-        <div class="flow-box accent"><div class="title">buy_etf(...)</div><div class="sub">persist state</div></div>
+        <div class="flow-box accent"><div class="title">buy_etf(...) → Firestore</div></div>
         <div class="arrow">↓</div>
         <div class="flow-box">
-          <div class="title">Update holdings.csv</div>
-          <div class="sub">new row OR merge avg price:<br><code>new_avg = (old_avg×old_qty + price×qty) / total_qty</code></div>
+          <div class="title">Write to <code>buys/{uuid}</code></div>
+          <div class="sub">full trade record stored</div>
         </div>
         <div class="arrow">↓</div>
         <div class="flow-box">
-          <div class="title">Update user.csv</div>
+          <div class="title">Upsert <code>holdings/{id}</code></div>
+          <div class="sub">new row <em>or</em> merge: <code>new_avg = (old_avg×old_qty + price×qty) / total_qty</code></div>
+        </div>
+        <div class="arrow">↓</div>
+        <div class="flow-box">
+          <div class="title">Update <code>meta/user</code></div>
           <div class="sub">
-            remaining -= (value + charges) &nbsp;|&nbsp; investment -= charges
+            <code>remainingAmount −= (value + charges)</code><br>
+            <code>investment −= charges</code>
           </div>
         </div>
         <div class="arrow">↓</div>
@@ -577,156 +688,242 @@
 
       <h3>Sell flow</h3>
       <div class="flow">
-        <div class="flow-box"><div class="title">Pick holding → Sell action</div></div>
+        <div class="flow-box"><div class="title">Open sell dialog on a holding card</div></div>
         <div class="arrow">↓</div>
-        <div class="flow-box"><div class="title">Enter sell price + qty</div></div>
+        <div class="flow-box"><div class="title">Enter sell price + qty</div><div class="sub">Itemized charge breakdown + net P/L shown live</div></div>
+        <div class="arrow">↓</div>
+        <div class="flow-box"><div class="title">compute_kotak_charges(value, type, "sell")</div></div>
+        <div class="arrow">↓</div>
+        <div class="flow-box accent"><div class="title">sell_holding(...) → Firestore</div></div>
+        <div class="arrow">↓</div>
+        <div class="flow-box"><div class="title">Write to <code>sells/{uuid}</code></div></div>
         <div class="arrow">↓</div>
         <div class="flow-box">
-          <div class="title">compute_kotak_charges(value, type, "sell")</div>
-          <div class="sub">gross − brokerage − STT − exchange − SEBI − GST − dividend = net</div>
+          <div class="title">Update <code>holdings/{id}</code></div>
+          <div class="sub">full qty sold → delete document · partial → reduce <code>totalQuantity</code></div>
         </div>
         <div class="arrow">↓</div>
-        <div class="flow-box accent"><div class="title">sell_holding(...)</div></div>
-        <div class="arrow">↓</div>
         <div class="flow-box">
-          <div class="title">Append row to sells.csv</div>
-        </div>
-        <div class="arrow">↓</div>
-        <div class="flow-box">
-          <div class="title">Update holdings.csv</div>
+          <div class="title">Update <code>meta/user</code></div>
           <div class="sub">
-            if full qty sold → drop row<br>
-            else → <code>new_avg = (old_avg×old_qty − price×sold_qty) / (old_qty − sold_qty)</code>
-          </div>
-        </div>
-        <div class="arrow">↓</div>
-        <div class="flow-box">
-          <div class="title">Update user.csv</div>
-          <div class="sub">
-            remaining += (value − charges − dividend)<br>
-            investment += ((sell − avg) × qty − charges − dividend)
+            <code>remainingAmount += (sell_value − charges − dividend)</code><br>
+            <code>investment += net_pl</code>  &nbsp;(= gross_pl − charges − dividend)
           </div>
         </div>
       </div>
-
-      <h3>Reports computation</h3>
-      <table>
-        <tr><th>Metric</th><th>Formula</th></tr>
-        <tr><td>Portfolio %</td><td><code>(currentValue − costBasis) / costBasis × 100</code></td></tr>
-        <tr><td>Profit/Loss (gross)</td><td><code>Σ (sellPrice − avgPrice) × qty</code></td></tr>
-        <tr><td>Growth (net)</td><td><code>Σ [(sell − avg) × qty − brokerage − tax − dividend]</code></td></tr>
-        <tr><td>Total Tax</td><td><code>Σ sells.tax</code></td></tr>
-        <tr><td>Total Brokerage</td><td><code>Σ sells.brokerageCharges</code></td></tr>
-        <tr><td>Pay to Self</td><td><code>Σ sells.dividendPaidToSelf</code></td></tr>
-      </table>
     </section>
 
+    <!-- ══════════════════════════════════════════════════════════════════ -->
     <section id="pages">
       <h2><span class="emoji">📑</span> 8. Page walkthrough</h2>
+
       <div class="grid-2">
-        <div class="card"><h3 style="margin-top:0">🏠 Home</h3>
-          <p>Portfolio overview. Holdings split into 🟢 Sell / 🔴 Buy-more / ⚪ Others tabs. Sell or buy-more inline.</p></div>
-        <div class="card"><h3 style="margin-top:0">💡 Suggestions</h3>
-          <p>Pre-computed top picks across Equity / Jewellery / Stocks. One-click buy.</p></div>
-        <div class="card"><h3 style="margin-top:0">📋 Listed ETFs</h3>
-          <p>Browse all fetched ETFs. Filter by type, search, sorted by dip.</p></div>
-        <div class="card"><h3 style="margin-top:0">📜 Sell History</h3>
-          <p>All past sells with per-row Gross &amp; Net P/L. Totals shown at top.</p></div>
-        <div class="card"><h3 style="margin-top:0">📊 Reports</h3>
-          <p>Portfolio %, realized P/L, growth, taxes, brokerage, pay-to-self.</p></div>
-        <div class="card"><h3 style="margin-top:0">⚙️ Settings</h3>
-          <p>Investment, thresholds, dividend %. View the Kotak rate table.</p></div>
+        <div class="card">
+          <h3 style="margin-top:0">🏠 Home</h3>
+          <p>Portfolio overview: 3 allocation cards (Equity / Jewellery / Stocks) showing cost basis, current value, and unrealized P/L. Holdings split across 3 tabs:</p>
+          <ul>
+            <li><strong>📋 All Holdings</strong> — default view, sorted by |P/L %| descending</li>
+            <li><strong>🟢 Sell</strong> — above profit target</li>
+            <li><strong>🔴 Buy more</strong> — below dip threshold</li>
+          </ul>
+          <p>Each holding card shows avg price, CMP, qty, cost, value, and P/L. Inline sell and buy-more forms open on click. Recent activity (last 5 buys + sells) shown at top.</p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0">💡 Suggestions</h3>
+          <p>Pre-computed buy suggestions in two groups:</p>
+          <ul>
+            <li><strong>Fresh picks</strong> — ETFs you don't hold with the deepest 20-DMA dip</li>
+            <li><strong>Buybacks</strong> — ETFs you already hold that are in the biggest dip</li>
+          </ul>
+          <p>One card per suggestion showing ETF name, type, CMP, dip %, and suggested quantity. One-click buy opens the buy dialog pre-filled.</p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0">📋 Listed ETFs</h3>
+          <p>Browse all ETFs fetched from the API. Filter by type (All / Equity / Jewellery / Stocks), search by name. Table sorted by 20-DMA dip descending. Shows CMP, 20-DMA, dip %, daily change %, and volume averages. Click any row to open buy dialog.</p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0">🔄 Transactions</h3>
+          <p>Four-tab paginated transaction log:</p>
+          <ul>
+            <li><strong>Buys</strong> — all buy records with charges</li>
+            <li><strong>Sells</strong> — all sell records with gross/net P/L</li>
+            <li><strong>Charges</strong> — AMC and other non-trade charges</li>
+            <li><strong>Cashflow</strong> — deposits and withdrawals</li>
+          </ul>
+          <p>Date range filter applies across all tabs. Pagination uses Firestore cursor-based queries (start_after + count aggregation).</p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0">📜 Sell History</h3>
+          <p>All past sells with formula-style cards showing gross P/L, charges breakdown, and net P/L per transaction. Date range filter. Running totals (total gross, total net, total fees) shown at top. Supports sell reversal — re-adds qty back to holdings and adjusts user balances.</p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0">📊 Reports</h3>
+          <p>Eight report sections:</p>
+          <ul>
+            <li>Portfolio snapshot (4 key metrics)</li>
+            <li>Ledger reconciliation (expected vs actual balance, ✓/✗)</li>
+            <li>Fees breakdown (brokerage, statutory, AMC, dividend)</li>
+            <li>Per-ETF money flow table</li>
+            <li>By type: Equity / Jewellery / Stocks allocation</li>
+            <li>Month-by-month flow table</li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0">⚙️ Settings</h3>
+          <p>Eight sections: Appearance (theme toggle), Profile, Investment thresholds, Sell profit target, Buy dip threshold, Dividend %, AMC config. Three action tabs: Deposit, Withdraw, Add Manual Charge.</p>
+        </div>
+
+        <div class="card">
+          <h3 style="margin-top:0">ℹ️ Info</h3>
+          <p>Renders this documentation file (<code>DOCUMENTATION.html</code>) inside a scrollable iframe. Anchor clicks scroll within the iframe — they don't reload the Streamlit app. Edit <code>DOCUMENTATION.html</code> to update the in-app docs.</p>
+        </div>
       </div>
+
       <div class="callout info">
-        <b>Sidebar stays visible everywhere:</b> 🔥 FIRE brand, navigation, 🔄 Refresh ETFs button, last-fetched timestamp, and quick-stat cards for Investment &amp; Remaining.
+        <b>Sidebar (always visible):</b> 🔥 FIRE brand + version badge · navigation radio · 🔄 Refresh ETFs button + last-fetched timestamp · Quick Stats card (deposited, after profit/loss with pill badge, cash in hand).
       </div>
     </section>
 
+    <!-- ══════════════════════════════════════════════════════════════════ -->
     <section id="files">
       <h2><span class="emoji">🔧</span> 9. Key files &amp; functions</h2>
 
-      <h3>data_manager.py — all business logic lives here</h3>
+      <h3>data_manager.py — all business logic &amp; Firestore I/O</h3>
       <table>
         <tr><th>Function</th><th>Role</th></tr>
-        <tr><td><code>load_user / save_user</code></td><td>CSV round-trip for user profile</td></tr>
-        <tr><td><code>load_holdings / save_holdings</code></td><td>CSV round-trip for holdings</td></tr>
-        <tr><td><code>load_sells / save_sells</code></td><td>CSV round-trip for sells</td></tr>
-        <tr><td><code>fetch_etfs()</code></td><td>Hits the Google Apps Script API, filters <code>cmp&gt;0</code>, caches</td></tr>
-        <tr><td><code>load_etfs_cache()</code></td><td>Reads cached CSV (offline fallback)</td></tr>
-        <tr><td><code>last_fetch_time()</code></td><td>mtime of the cache file — shown in sidebar</td></tr>
-        <tr><td><code>compute_kotak_charges(value, type, side)</code></td><td><strong>Returns full fee breakdown</strong></td></tr>
-        <tr><td><code>buy_etf(...)</code></td><td>Execute a buy, persist all state, return charges</td></tr>
-        <tr><td><code>sell_holding(...)</code></td><td>Execute a sell, persist, return charges</td></tr>
-        <tr><td><code>generate_suggestions(...)</code></td><td>Run the suggestion algorithm</td></tr>
-        <tr><td><code>classify_holdings(...)</code></td><td>Split into sell / buy-more / others</td></tr>
-        <tr><td><code>compute_report(...)</code></td><td>Aggregates for the Reports page</td></tr>
+        <tr><td><code>init_firebase()</code></td><td>Initialise firebase-admin SDK; picks service account from file (local) or <code>st.secrets</code> (cloud)</td></tr>
+        <tr><td><code>load_user() / save_user()</code></td><td>Read / write <code>meta/user</code> as <code>UserSettings</code> dataclass</td></tr>
+        <tr><td><code>load_holdings() / save_holding()</code></td><td>Load all holdings or upsert a single document</td></tr>
+        <tr><td><code>load_buys() / load_sells()</code></td><td>Load full buy / sell history into DataFrames</td></tr>
+        <tr><td><code>load_charges() / load_cashflow()</code></td><td>Load charges and cashflow collections</td></tr>
+        <tr><td><code>fetch_etfs()</code></td><td>Hit Google Apps Script API, filter <code>cmp &gt; 0</code>, write cache</td></tr>
+        <tr><td><code>load_etfs_cache()</code></td><td>Read local <code>etfs_cache.csv</code> as offline fallback</td></tr>
+        <tr><td><code>compute_kotak_charges(value, type, side)</code></td><td>Returns full itemized fee breakdown dict</td></tr>
+        <tr><td><code>buy_etf(...)</code></td><td>Execute buy: write buys doc, upsert holding, update user; returns charges dict</td></tr>
+        <tr><td><code>sell_holding(...)</code></td><td>Execute sell: write sells doc, update/delete holding, update user; returns charges dict</td></tr>
+        <tr><td><code>reverse_sell(...)</code></td><td>Undo a sell: delete sells doc, restore holding qty, reverse user balance changes</td></tr>
+        <tr><td><code>generate_suggestions(holdings, etfs, user)</code></td><td>Run the dip-based suggestion algorithm; returns fresh picks + buybacks</td></tr>
+        <tr><td><code>classify_holdings(holdings, etfs, user)</code></td><td>Split holdings into sell / buy-more / others groups</td></tr>
+        <tr><td><code>compute_report(holdings, sells, etfs)</code></td><td>Aggregate portfolio %, realized P/L, fee totals</td></tr>
+        <tr><td><code>compute_money_summary(user, buys, sells, holdings, etfs)</code></td><td>Full ledger reconciliation dict</td></tr>
+        <tr><td><code>money_by_etf(buys, sells, holdings, etfs)</code></td><td>Per-ETF outflow/inflow/P&amp;L breakdown DataFrame</td></tr>
+        <tr><td><code>money_by_month(buys, sells)</code></td><td>Month-wise flow DataFrame</td></tr>
+        <tr><td><code>check_and_apply_amc(user)</code></td><td>Auto-deduct AMC if 30 days have passed; write charges doc</td></tr>
+        <tr><td><code>fix_reconciliation_drift(user, buys, sells, holdings, etfs)</code></td><td>Recompute correct <code>remainingAmount</code> and patch Firestore</td></tr>
+        <tr><td><code>paginate_buys/sells/charges/cashflow()</code></td><td>Cursor-based Firestore pagination with total count</td></tr>
       </table>
 
-      <h3>app.py — UI + routing</h3>
+      <h3>app.py — UI, auth &amp; routing</h3>
       <table>
-        <tr><th>Section</th><th>Role</th></tr>
-        <tr><td><code>CUSTOM_CSS</code></td><td>Dark-theme polish for cards, badges, metrics</td></tr>
-        <tr><td><code>ensure_state()</code></td><td>Session bootstrap on first request</td></tr>
-        <tr><td><code>refresh_etfs()</code></td><td>Manual re-fetch + re-suggest</td></tr>
-        <tr><td><code>fmt_money / fmt_pct / pnl_class / badge</code></td><td>Display helpers</td></tr>
-        <tr><td><code>_render_charge_breakdown()</code></td><td>The itemized Kotak fee box under every trade form</td></tr>
-        <tr><td><code>_sell_form / _buy_more_form</code></td><td>Inline forms on each holding card</td></tr>
-        <tr><td><code>page_home / page_suggestions / ...</code></td><td>One function per screen</td></tr>
+        <tr><th>Section / function</th><th>Role</th></tr>
+        <tr><td><code>_make_token() / _verify_token()</code></td><td>HMAC-SHA256 session token generation and verification (7-hour TTL)</td></tr>
+        <tr><td><code>ensure_state()</code></td><td>Session bootstrap — loads user, ETFs, suggestions; calls AMC check</td></tr>
+        <tr><td><code>refresh_etfs()</code></td><td>Manual re-fetch + re-generate suggestions</td></tr>
+        <tr><td><code>fmt_money / fmt_pct / pnl_class / badge</code></td><td>Display helper functions</td></tr>
+        <tr><td><code>metric_card / section</code></td><td>Reusable HTML card and section header components</td></tr>
+        <tr><td><code>_tip / _stat</code></td><td>Sidebar Quick Stats pill-badge layout helpers</td></tr>
+        <tr><td><code>_render_charge_breakdown()</code></td><td>Itemized Kotak fee table shown under every trade form</td></tr>
+        <tr><td><code>_sell_dialog / _buy_more_dialog</code></td><td>Modal dialogs for sell and buy-more actions on holding cards</td></tr>
+        <tr><td><code>page_home / page_suggestions / page_listed_etfs</code></td><td>Home, Suggestions, Listed ETFs pages</td></tr>
+        <tr><td><code>page_transactions / page_sell_history</code></td><td>Transactions (4-tab paginated log) and Sell History pages</td></tr>
+        <tr><td><code>page_reports / page_settings / page_info</code></td><td>Reports, Settings, Info pages</td></tr>
       </table>
     </section>
 
+    <!-- ══════════════════════════════════════════════════════════════════ -->
     <section id="run">
       <h2><span class="emoji">▶️</span> 10. How to run</h2>
-      <pre><code>cd python_version
-python3 -m venv .venv
-source .venv/bin/activate
+
+      <h3>Local development</h3>
+      <pre><code>git clone https://github.com/RavindraMedhat/FIRE_firebase.git
+cd FIRE_firebase
+git checkout feature/firebase-firestore
 pip install -r requirements.txt
+
+# Add Firebase service account key:
+# Go to Firebase Console → project myfire-1783b → Gear → Service accounts
+# → Generate new private key → save as serviceAccountKey.json
+
 streamlit run app.py</code></pre>
-      <p>Open <a href="http://localhost:8501" target="_blank">http://localhost:8501</a></p>
+      <p>Opens at <a href="http://localhost:8501" target="_blank">http://localhost:8501</a></p>
+      <ul>
+        <li><strong>First launch</strong> → prompted to create a password (stored as HMAC key in <code>meta/config</code>)</li>
+        <li><strong>Login</strong> → enter password → HMAC token injected into URL → stays logged in for 7 hours</li>
+      </ul>
+
+      <h3>Streamlit Cloud deploy</h3>
+      <ol>
+        <li>Go to <a href="https://share.streamlit.io" target="_blank">share.streamlit.io</a> → New app → repo <code>RavindraMedhat/FIRE_firebase</code>, branch <code>feature/firebase-firestore</code>, file <code>app.py</code></li>
+        <li>Under <strong>Advanced settings → Secrets</strong>, paste the contents of your local <code>.streamlit/secrets.toml</code> (contains Firebase service account as <code>[gcp_service_account]</code>)</li>
+        <li>Deploy. The app auto-detects the cloud environment and reads credentials from <code>st.secrets</code> instead of the local JSON file.</li>
+      </ol>
 
       <div class="callout">
         <strong>First-run checklist</strong>
         <ol>
-          <li>Open ⚙️ Settings → set your total investment → Save.</li>
+          <li>Open ⚙️ Settings → verify investment amount, remaining cash, thresholds.</li>
           <li>Go to 💡 Suggestions → see top picks → click Buy.</li>
-          <li>Home shows the holding; when CMP moves, it'll appear in 🟢 Sell or 🔴 Buy-more automatically.</li>
+          <li>Home shows the new holding; when CMP moves it appears in 🟢 Sell or 🔴 Buy more automatically.</li>
+          <li>After a sell, check 📊 Reports → "Verify the totals" to confirm ✓ books balance.</li>
         </ol>
       </div>
     </section>
 
+    <!-- ══════════════════════════════════════════════════════════════════ -->
     <section id="extend">
       <h2><span class="emoji">🛠️</span> 11. Extending the app</h2>
       <table>
-        <tr><th>If you want to...</th><th>Edit</th></tr>
-        <tr><td>Change broker rates</td><td><code>KOTAK_RATES</code> &amp; <code>*_PCT</code> constants in <code>data_manager.py</code></td></tr>
-        <tr><td>Change the suggestion algorithm</td><td><code>generate_suggestions()</code> in <code>data_manager.py</code></td></tr>
-        <tr><td>Change buy/sell thresholds</td><td>Settings page — or <code>UserSettings</code> defaults</td></tr>
-        <tr><td>Add a new page</td><td>Write <code>page_xxx()</code> in <code>app.py</code>, add to sidebar radio + router</td></tr>
-        <tr><td>Switch data source</td><td>Replace <code>API_URL</code> in <code>data_manager.py</code> (same JSON shape)</td></tr>
+        <tr><th>If you want to…</th><th>Where to edit</th></tr>
+        <tr><td>Change broker rates</td><td><code>KOTAK_RATES</code> dict + <code>*_PCT</code> constants in <code>data_manager.py</code></td></tr>
+        <tr><td>Change suggestion algorithm</td><td><code>generate_suggestions()</code> in <code>data_manager.py</code></td></tr>
+        <tr><td>Change default thresholds</td><td><code>UserSettings</code> dataclass defaults in <code>data_manager.py</code>, or Settings page at runtime</td></tr>
+        <tr><td>Add a new page</td><td>Write <code>page_xxx()</code> in <code>app.py</code>, add to sidebar radio list + router if/elif chain</td></tr>
+        <tr><td>Change AMC amount</td><td>Settings page → AMC section; or edit <code>amcAmount</code> default in <code>UserSettings</code></td></tr>
+        <tr><td>Add a new Firestore collection</td><td>Add load/save functions in <code>data_manager.py</code> following the existing pattern</td></tr>
+        <tr><td>Switch ETF data source</td><td>Replace <code>API_URL</code> in <code>data_manager.py</code> — same JSON shape expected</td></tr>
+        <tr><td>Update these docs</td><td>Edit <code>DOCUMENTATION.html</code> — changes appear immediately on the Info page</td></tr>
       </table>
     </section>
 
+    <!-- ══════════════════════════════════════════════════════════════════ -->
     <section id="limits">
       <h2><span class="emoji">⚠️</span> 12. Known simplifications</h2>
       <ol>
-        <li><strong>Avg price ignores buy-side charges.</strong> Kotak shows traded avg the same way. Buy charges are deducted from <code>remainingAmount</code> and <code>investment</code> instead. Cost-basis P/L is slightly under-reported by buy fees (tiny for ETFs, small for stocks).</li>
-        <li><strong>Single-user only</strong> — no login, no isolation.</li>
-        <li><strong>ETF data freshness</strong> depends on the upstream Google Apps Script.</li>
-        <li><strong>No retry / offline queue</strong> — if API is down on startup, we fall back to cached CSV.</li>
-        <li><strong>Holdings &gt; 20 warning</strong> is a soft UX nudge, not enforced.</li>
+        <li><strong>Average price ignores buy-side charges.</strong> Cost basis P/L is slightly under-reported by buy fees. This matches how Kotak displays traded average.</li>
+        <li><strong>DP charges not auto-computed.</strong> Kotak deducts ₹27 min / ISIN / day on delivery sells. These must be logged manually via Settings → Add Manual Charge, or the app balance will run slightly higher than the actual Kotak balance over time.</li>
+        <li><strong>Single-user only.</strong> One password, one Firestore project.</li>
+        <li><strong>ETF data freshness</strong> depends on the upstream Google Apps Script — if it's down, the app falls back to the local cache file.</li>
+        <li><strong>No retry / offline queue</strong> — Firestore writes fail loudly; there's no local queue for offline operation.</li>
+        <li><strong>No STT tracking on equity stock sells</strong> — the charge is computed and deducted from remaining amount, but not tracked in a separate line for tax filing purposes.</li>
+        <li><strong>Holdings &gt; 20 warning</strong> is a soft UX nudge in Reports; not enforced.</li>
       </ol>
     </section>
 
     <hr>
     <p style="text-align:center; color:var(--muted); font-size:0.85rem">
-      FIRE — a local, single-user, Kotak-aware investment tracker in Python.<br>
-      Documentation built for your understanding &amp; others to follow.
+      FIRE — Firebase-backed, single-user, Kotak-aware investment tracker in Python + Streamlit.<br>
+      Edit <code>DOCUMENTATION.html</code> to update this page.
     </p>
 
   </main>
 </div>
 
 <script>
+  // Intercept anchor clicks — scroll within iframe instead of navigating parent
+  document.querySelectorAll('a[href^="#"]').forEach(a => {
+    a.addEventListener('click', function(e) {
+      e.preventDefault();
+      const target = document.querySelector(this.getAttribute('href'));
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  });
+
   // Highlight active nav link on scroll
   const sections = document.querySelectorAll('section[id]');
   const navLinks = document.querySelectorAll('.nav a');
