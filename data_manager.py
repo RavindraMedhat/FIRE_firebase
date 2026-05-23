@@ -1199,6 +1199,7 @@ def compute_money_summary(
     sells: pd.DataFrame,
     holdings: pd.DataFrame,
     etfs: pd.DataFrame,
+    charges: pd.DataFrame | None = None,
 ) -> dict:
     buy_count = 0
     buy_gross = 0.0
@@ -1269,17 +1270,20 @@ def compute_money_summary(
     unrealized_pl = current_value - cost_basis
 
     current_investment = float(user.investment)
-    # Display value: stored totalDeposited (real money you put in)
     initial_deposit = float(user.totalDeposited) if user.totalDeposited > 0 else current_investment - sell_net_pl
-    # Reconciliation baseline: derived from investment (absorbs all historical adjustments)
-    reconcile_deposit = current_investment - sell_net_pl
     remaining_cash = float(user.remainingAmount)
+
+    charges_total = 0.0
+    if charges is not None and not charges.empty:
+        charges_total = float(charges["amount"].astype(float).sum())
 
     fees_paid_total = buy_total_charges + sell_fees_total
     money_consumed = fees_paid_total + sell_dividend
 
     account_balance = remaining_cash + cost_basis
-    expected_balance = reconcile_deposit + sell_gross_pl - money_consumed
+    # Formula derived from first principles — independent of investment field:
+    # remaining + cost_basis = totalDeposited + sell_net_pl − buy_charges − charges_total
+    expected_balance = initial_deposit + sell_net_pl - buy_total_charges - charges_total
     diff = account_balance - expected_balance
 
     return {
@@ -1307,6 +1311,7 @@ def compute_money_summary(
         "sellNetPL": sell_net_pl,
         "feesPaidTotal": fees_paid_total,
         "moneyConsumed": money_consumed,
+        "chargesTotal": charges_total,
         "accountBalance": account_balance,
         "expectedBalance": expected_balance,
         "reconcileDiff": diff,
@@ -1392,16 +1397,14 @@ def fix_reconciliation_drift(
     sells: pd.DataFrame,
     holdings: pd.DataFrame,
     etfs: pd.DataFrame,
+    charges: pd.DataFrame | None = None,
 ) -> tuple["UserSettings", float]:
     """Eliminate reconciliation drift by adjusting remainingAmount.
 
-    Drift is almost always caused by backfilled buy records that include
-    computed charges which were never actually deducted from remainingAmount
-    (because the original holdings predate per-trade charge tracking).
     Subtracting the diff from remainingAmount re-aligns the books.
     Returns (updated_user, adjustment_applied).
     """
-    m = compute_money_summary(user, buys, sells, holdings, etfs)
+    m = compute_money_summary(user, buys, sells, holdings, etfs, charges)
     diff = m["reconcileDiff"]
     if abs(diff) < 0.001:
         return user, 0.0

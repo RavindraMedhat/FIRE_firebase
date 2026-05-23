@@ -1059,21 +1059,23 @@ def _sell_form(row: pd.Series) -> None:
     )
 
     kotak_total = st.number_input(
-        "Total received from Kotak (₹) — optional",
+        "Kotak gross total — Market Rate × Qty (optional)",
         min_value=0.0,
         value=0.0,
         step=0.01,
         format="%.2f",
-        help="Paste the exact amount credited in your Kotak ledger. "
-             "Overrides per-unit price and eliminates rounding gaps.",
+        help="Enter Market Rate × Qty from your Kotak transaction statement "
+             "(the gross value BEFORE charges are deducted). "
+             "Do NOT enter the net credit amount from the ledger — "
+             "that causes charges to be counted twice.",
         key=f"kt_{row['id']}",
     )
 
-    # Use Kotak total if entered, otherwise fall back to price × qty
+    # Use Kotak gross total if entered, otherwise fall back to price × qty
     if kotak_total > 0:
         effective_price = kotak_total / qty
         gross = kotak_total
-        st.caption(f"Effective price: ₹{effective_price:.4f}/unit")
+        st.caption(f"Effective price: ₹{effective_price:.4f}/unit (gross rate)")
     else:
         effective_price = sell_price
         gross = sell_price * qty
@@ -1926,9 +1928,8 @@ def page_reports() -> None:
     sells    = dm.load_sells()
     buys     = dm.load_buys()
     charges  = dm.load_charges()
-    amc_total = charges["amount"].astype(float).sum() if not charges.empty else 0.0
     r = dm.compute_report(holdings, sells, etfs)
-    m = dm.compute_money_summary(user, buys, sells, holdings, etfs)
+    m = dm.compute_money_summary(user, buys, sells, holdings, etfs, charges)
 
     # ── Portfolio snapshot ────────────────────────────────────────────────
     section("Portfolio snapshot")
@@ -1946,7 +1947,7 @@ def page_reports() -> None:
     u1, u2, u3, u4 = st.columns(4)
     u1.markdown(metric_card(f"Spent on buys ({m['buyCount']})",   fmt_money(m["buyOutflow"],  2)), unsafe_allow_html=True)
     u2.markdown(metric_card(f"Got from sells ({m['sellCount']})", fmt_money(m["sellInflow"],  2)), unsafe_allow_html=True)
-    u3.markdown(metric_card("Fees paid total", fmt_money(m["feesPaidTotal"] + amc_total, 2)),      unsafe_allow_html=True)
+    u3.markdown(metric_card("Fees paid total", fmt_money(m["feesPaidTotal"] + m["chargesTotal"], 2)),      unsafe_allow_html=True)
     u4.markdown(
         metric_card("Realized profit", fmt_money(m["sellNetPL"], 2), delta_class=pnl_class(m["sellNetPL"])),
         unsafe_allow_html=True,
@@ -2005,7 +2006,7 @@ def page_reports() -> None:
             if not st.session_state.get(_guard):
                 st.session_state[_guard] = True
                 updated_user, adj = dm.fix_reconciliation_drift(
-                    st.session_state.user, buys, sells, holdings, etfs
+                    st.session_state.user, buys, sells, holdings, etfs, charges
                 )
                 st.session_state.user = updated_user
                 st.toast(f"✅ Remaining Amount adjusted by ₹{-adj:+.4f} — books balanced.", icon="🔧")
@@ -2020,12 +2021,12 @@ def page_reports() -> None:
         ("Brokerage on sells",        m["sellBrokerage"]),
         ("Statutory on sells",        m["sellTax"]),
         ("Dividend paid to self",     m["sellDividend"]),
-        ("Demat AMC & charges",       amc_total),
+        ("Demat AMC & charges",       m["chargesTotal"]),
     ]
     cols = st.columns(len(fees_items))
     for col, (label, val) in zip(cols, fees_items):
         col.markdown(metric_card(label, fmt_money(val, 2)), unsafe_allow_html=True)
-    total_consumed = m["moneyConsumed"] + amc_total
+    total_consumed = m["moneyConsumed"] + m["chargesTotal"]
     st.markdown(
         f'<div style="text-align:right;margin-top:6px;font-size:0.85rem">'
         f'Total money consumed &nbsp;<b>{fmt_money(total_consumed, 2)}</b></div>',
