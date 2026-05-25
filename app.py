@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -602,6 +602,23 @@ def section(title: str) -> None:
     st.markdown(f'<div class="section-hdr">{title}</div>', unsafe_allow_html=True)
 
 
+def _fmt_hold_days(days: int) -> str:
+    """Format a day count as a human-readable holding duration."""
+    if days <= 0:
+        return "0d"
+    if days < 7:
+        return f"{days}d"
+    if days < 30:
+        w, d = divmod(days, 7)
+        return f"{w}w {d}d" if d else f"{w}w"
+    if days < 365:
+        m, d = divmod(days, 30)
+        return f"{m}mo {d}d" if d else f"{m}mo"
+    y, rem = divmod(days, 365)
+    m = rem // 30
+    return f"{y}y {m}mo" if m else f"{y}y"
+
+
 def _format_last_fetch() -> str:
     ts = dm.last_fetch_time()
     if ts is None:
@@ -752,7 +769,11 @@ def page_home() -> None:
     pnl = current_value - cost_basis
     pnl_pct = (pnl / cost_basis * 100) if cost_basis else 0.0
 
-    c1, c2, c3, c4 = st.columns(4)
+    ht = dm.compute_holding_time_stats(holdings, dm.load_sells(), dm.load_buys())
+    wavg_open_days = int(ht["weightedAvgDaysOpen"])
+    hold_time_by_etf = {op["etfName"]: op["holdingDays"] for op in ht["openPositions"]}
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.markdown(metric_card("Holdings", f"{len(holdings)}"), unsafe_allow_html=True)
     c2.markdown(metric_card("Cost Basis", fmt_money(cost_basis)), unsafe_allow_html=True)
     c3.markdown(metric_card("Current Value", fmt_money(current_value)), unsafe_allow_html=True)
@@ -765,6 +786,7 @@ def page_home() -> None:
         ),
         unsafe_allow_html=True,
     )
+    c5.markdown(metric_card("Avg Hold Time", _fmt_hold_days(wavg_open_days)), unsafe_allow_html=True)
 
     if len(holdings) > 20:
         st.warning(f"⚠️ You hold {len(holdings)} ETFs — consider consolidating (>20).")
@@ -839,25 +861,26 @@ def page_home() -> None:
 
     if selected == sell_label:
         st.caption(f"ETFs where CMP > avg × (1 + {user.sellProfitTarget:.2f}%) — in profit zone, sorted by |P/L %|")
-        _render_holding_cards(groups["sell"], kind="sell")
+        _render_holding_cards(groups["sell"], kind="sell", hold_time_by_etf=hold_time_by_etf)
     elif selected == buy_label:
         st.caption(f"ETFs where CMP < avg × (1 − {user.buyInDipThreshold:.2f}%) — in dip, sorted by |P/L %|")
-        _render_holding_cards(groups["buy"], kind="buy")
+        _render_holding_cards(groups["buy"], kind="buy", hold_time_by_etf=hold_time_by_etf)
     else:
         st.caption("Holdings between thresholds — sorted by |P/L %|")
-        _render_holding_cards(groups["others"], kind="others")
+        _render_holding_cards(groups["others"], kind="others", hold_time_by_etf=hold_time_by_etf)
 
     _render_recent_activity()
 
 
 def _render_recent_activity() -> None:
-    """Show the last 3 buys + sells combined, newest first."""
-    buys = dm.load_buys()
-    sells = dm.load_sells()
-    if buys.empty and sells.empty:
+    """Show the last 5 buys + sells combined, newest first.
+    Uses paginated fetches — never loads the full collections."""
+    recent_buys, _  = dm.fetch_buys_page(5)
+    recent_sells, _ = dm.fetch_sells_page(5)
+    if recent_buys.empty and recent_sells.empty:
         return
     events = []
-    for _, r in buys.iterrows():
+    for _, r in recent_buys.iterrows():
         events.append({
             "when": str(r["buyDate"]),
             "kind": "Buy",
@@ -867,7 +890,7 @@ def _render_recent_activity() -> None:
             "price": float(r["price"]),
             "color": "text-green",
         })
-    for _, r in sells.iterrows():
+    for _, r in recent_sells.iterrows():
         events.append({
             "when": str(r["sellDate"]),
             "kind": "Sell",
@@ -895,7 +918,11 @@ def _render_recent_activity() -> None:
     st.caption("Go to **🔄 Transactions** to reverse any of these.")
 
 
-def _render_holding_cards(df: pd.DataFrame, kind: str) -> None:
+def _render_holding_cards(
+    df: pd.DataFrame,
+    kind: str,
+    hold_time_by_etf: dict | None = None,
+) -> None:
     if df.empty:
         st.info("Nothing here.")
         return
@@ -908,6 +935,24 @@ def _render_holding_cards(df: pd.DataFrame, kind: str) -> None:
             return
 
     df = df.copy()
+
+    # Weighted-avg holding time for this group — use per-lot dict when available
+    hold_stats = []
+    for _, row in df.iterrows():
+        etf_name = str(row["etfName"])
+        if hold_time_by_etf and etf_name in hold_time_by_etf:
+            days = int(hold_time_by_etf[etf_name])
+        else:
+            try:
+                buy_dt = pd.to_datetime(row["lastPurchaseDate"]).date()
+                days = max(0, (date.today() - buy_dt).days)
+            except Exception:
+                days = 0
+        cost_basis = float(row["averagePrice"]) * int(row["totalQuantity"])
+        hold_stats.append((days, cost_basis))
+    total_basis = sum(cb for _, cb in hold_stats)
+    wavg_days = int(sum(d * cb for d, cb in hold_stats) / total_basis) if total_basis > 0 else 0
+    st.caption(f"Weighted avg holding time: **{_fmt_hold_days(wavg_days)}** across {len(df)} position(s)")
     avg = df["averagePrice"].astype(float)
     cmp_f = df["cmp"].astype(float)
     has_cmp = cmp_f > 0
@@ -946,9 +991,19 @@ def _render_holding_cards(df: pd.DataFrame, kind: str) -> None:
                 f'<div>₹{float(row["cmp"]):,.2f}</div>',
                 unsafe_allow_html=True,
             )
+            etf_nm = str(row["etfName"])
+            if hold_time_by_etf and etf_nm in hold_time_by_etf:
+                _held_d = int(hold_time_by_etf[etf_nm])
+            else:
+                try:
+                    _buy_dt = pd.to_datetime(row["lastPurchaseDate"]).date()
+                    _held_d = max(0, (date.today() - _buy_dt).days)
+                except Exception:
+                    _held_d = 0
             top[3].markdown(
-                f'<div class="text-muted" style="font-size:0.75rem">QTY</div>'
-                f'<div>{int(row["totalQuantity"])}</div>',
+                f'<div class="text-muted" style="font-size:0.75rem">QTY · HELD</div>'
+                f'<div>{int(row["totalQuantity"])}</div>'
+                f'<div class="text-muted" style="font-size:0.78rem">{_fmt_hold_days(_held_d)}</div>',
                 unsafe_allow_html=True,
             )
 
@@ -1789,7 +1844,7 @@ def page_sell_history() -> None:
     )
 
     # ── Summary cards ────────────────────────────────────────────────────────
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     label_sfx = f" (of {total})" if has_more else ""
     c1.markdown(metric_card("Transactions shown", f"{loaded}{label_sfx}"), unsafe_allow_html=True)
     total_gross = float(view["grossPL"].sum())
@@ -1802,6 +1857,12 @@ def page_sell_history() -> None:
         metric_card("Net P/L" + (" ↗" if has_more else ""), fmt_money(total_net), delta_class=pnl_class(total_net)),
         unsafe_allow_html=True,
     )
+    # Weighted avg holding time — from stamped holdingDays, weighted by investment
+    _inv  = view["averagePurchasePrice"].astype(float) * view["quantity"].astype(float)
+    _hd   = pd.to_numeric(view.get("holdingDays", pd.Series(dtype=float)), errors="coerce")
+    _mask = _hd.notna()
+    _sh_wavg = int((_hd[_mask] * _inv[_mask]).sum() / _inv[_mask].sum()) if _mask.any() and _inv[_mask].sum() > 0 else 0
+    c4.markdown(metric_card("Avg Hold Time" + (" ↗" if has_more else ""), _fmt_hold_days(_sh_wavg)), unsafe_allow_html=True)
     if has_more:
         st.caption(f"↗ Showing {loaded} of {total} sells — load more below to include all records in the totals.")
 
@@ -1839,11 +1900,22 @@ def page_sell_history() -> None:
         invested   = avg_buy * qty
         sell_val   = sell_p * qty
         fees_total = brok + tax + div
+        try:
+            _held_days = int(float(row["holdingDays"]))
+        except Exception:
+            try:
+                _sell_dt = pd.to_datetime(row["sellDate"]).date()
+                _buy_dt  = pd.to_datetime(row["lastPurchaseDate"]).date()
+                _held_days = max(0, (_sell_dt - _buy_dt).days)
+            except Exception:
+                _held_days = 0
+
         with st.container(border=True):
             # ── Header ────────────────────────────────────────────────────
             hc1, hc2 = st.columns([4, 1])
             hc1.markdown(
-                f'**{row["etfName"]}** &nbsp; {badge(str(row["etfType"]), "equity")}',
+                f'**{row["etfName"]}** &nbsp; {badge(str(row["etfType"]), "equity")}'
+                f' &nbsp;<span class="text-muted" style="font-size:0.78rem">held {_fmt_hold_days(_held_days)}</span>',
                 unsafe_allow_html=True,
             )
             hc2.markdown(
@@ -1922,38 +1994,139 @@ def page_sell_history() -> None:
 
 def page_reports() -> None:
     st.markdown('<h2 style="margin-top:0">📊 Reports</h2>', unsafe_allow_html=True)
-    st.caption("How much money you used, where it went, and whether the totals add up.")
 
     holdings = dm.load_holdings()
-    sells    = dm.load_sells()
-    buys     = dm.load_buys()
-    charges  = dm.load_charges()
-    r = dm.compute_report(holdings, sells, etfs)
-    m = dm.compute_money_summary(user, buys, sells, holdings, etfs, charges)
+    m = dm.compute_money_summary_from_stats(user, holdings, etfs)
+    ht = dm.compute_holding_time_stats(holdings, dm.load_sells(), dm.load_buys())
+    avg_hold_days = int(ht["weightedAvgDaysOpen"])
 
-    # ── Portfolio snapshot ────────────────────────────────────────────────
-    section("Portfolio snapshot")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.markdown(metric_card("Initial deposit",    fmt_money(m["initialDeposit"], 2)), unsafe_allow_html=True)
-    c2.markdown(metric_card("Cash remaining",     fmt_money(m["remainingCash"],  2)), unsafe_allow_html=True)
-    c3.markdown(metric_card("Money in holdings",  fmt_money(m["costBasis"],      2)), unsafe_allow_html=True)
-    c4.markdown(
-        metric_card("Current value", fmt_money(m["currentValue"], 2),
-                    delta=fmt_pct(r["portfolioPct"]) if m["costBasis"] else None,
-                    delta_class=pnl_class(m["unrealizedPL"])),
+    # ── Chapter 1 — The headline ──────────────────────────────────────────
+    deployed      = m["costBasis"] + m["buyTotalCharges"]
+    total_return  = m["unrealizedPL"] + m["sellNetPL"]
+    total_ret_pct = (total_return / deployed * 100) if deployed else 0.0
+    pnl_col_h     = "#2ecc71" if total_return >= 0 else "#e74c3c"
+    direction     = "up" if total_return >= 0 else "down"
+    ret_sign      = "+" if total_return >= 0 else "−"
+
+    st.markdown(
+        f'<div style="background:var(--secondary-background-color);border-radius:12px;'
+        f'padding:24px 28px;margin-bottom:4px">'
+        f'<div style="font-size:0.72rem;text-transform:uppercase;letter-spacing:.09em;'
+        f'opacity:0.5;margin-bottom:8px">Your portfolio</div>'
+        f'<div style="font-size:1.55rem;font-weight:700;line-height:1.3">'
+        f'You\'ve deployed <span style="color:#3b9ddd">{fmt_money(deployed, 0)}</span> '
+        f'into the market. Currently <span style="color:{pnl_col_h}">{direction}: '
+        f'{ret_sign}₹{abs(total_return):,.0f} ({abs(total_ret_pct):.2f}%)</span>'
+        f'</div>'
+        f'<div style="margin-top:10px;font-size:0.85rem;opacity:0.6">'
+        f'{fmt_money(m["costBasis"], 0)} in holdings &nbsp;·&nbsp; '
+        f'{fmt_money(m["remainingCash"], 0)} cash remaining &nbsp;·&nbsp; '
+        f'avg hold {avg_hold_days}d'
+        f'</div>'
+        f'</div>',
         unsafe_allow_html=True,
     )
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    u1, u2, u3, u4 = st.columns(4)
-    u1.markdown(metric_card(f"Spent on buys ({m['buyCount']})",   fmt_money(m["buyOutflow"],  2)), unsafe_allow_html=True)
-    u2.markdown(metric_card(f"Got from sells ({m['sellCount']})", fmt_money(m["sellInflow"],  2)), unsafe_allow_html=True)
-    u3.markdown(metric_card("Fees paid total", fmt_money(m["feesPaidTotal"] + m["chargesTotal"], 2)),      unsafe_allow_html=True)
-    u4.markdown(
-        metric_card("Realized profit", fmt_money(m["sellNetPL"], 2), delta_class=pnl_class(m["sellNetPL"])),
+
+    # ── Chapter 2 — How the money is working ─────────────────────────────
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    unreal_sign = "+" if m["unrealizedPL"] >= 0 else "−"
+    unreal_pct  = (m["unrealizedPL"] / m["costBasis"] * 100) if m["costBasis"] else 0.0
+    real_sign   = "+" if m["sellNetPL"] >= 0 else "−"
+
+    col_left, col_right = st.columns(2)
+    with col_left:
+        with st.container(border=True):
+            st.markdown(
+                '<div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:.09em;'
+                'opacity:0.45;margin-bottom:10px">Still in market</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(metric_card("Cost basis", fmt_money(m["costBasis"], 2)), unsafe_allow_html=True)
+            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+            st.markdown(
+                metric_card(
+                    "Worth now", fmt_money(m["currentValue"], 2),
+                    delta=f"{unreal_sign}₹{abs(m['unrealizedPL']):,.2f} ({abs(unreal_pct):.2f}%)",
+                    delta_class=pnl_class(m["unrealizedPL"]),
+                ),
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div style="margin-top:8px;font-size:0.8rem;opacity:0.55">'
+                f'{len(holdings)} open position{"s" if len(holdings) != 1 else ""}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    with col_right:
+        with st.container(border=True):
+            st.markdown(
+                '<div style="font-size:0.68rem;text-transform:uppercase;letter-spacing:.09em;'
+                'opacity:0.45;margin-bottom:10px">Already sold</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                metric_card(f"Gross sold ({m['sellCount']} sells)", fmt_money(m["sellGross"], 2)),
+                unsafe_allow_html=True,
+            )
+            st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+            st.markdown(
+                metric_card(
+                    "Net profit after fees", fmt_money(m["sellNetPL"], 2),
+                    delta=f"{real_sign}₹{abs(m['sellNetPL']):,.2f}",
+                    delta_class=pnl_class(m["sellNetPL"]),
+                ),
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div style="margin-top:8px;font-size:0.8rem;opacity:0.55">'
+                f'Cash received back: {fmt_money(m["sellInflow"], 2)}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Chapter 3 — What it cost you ─────────────────────────────────────
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    section("What it cost you")
+
+    total_fees   = m["feesPaidTotal"] + m["chargesTotal"]
+    fee_drag_pct = (total_fees / deployed * 100) if deployed else 0.0
+
+    st.markdown(
+        f'<div style="font-size:1rem;margin-bottom:14px;line-height:1.6">'
+        f'You paid <b>{fmt_money(total_fees, 2)}</b> in total fees — '
+        f'<b>{fee_drag_pct:.2f}%</b> of deployed capital. '
+        f'Break-even on a round-trip trade: <b>~0.33%</b>.'
+        f'</div>',
         unsafe_allow_html=True,
     )
+    f1, f2, f3 = st.columns(3)
+    f1.markdown(
+        metric_card(f"Buy fees ({m['buyCount']} buys)", fmt_money(m["buyTotalCharges"], 2)),
+        unsafe_allow_html=True,
+    )
+    f2.markdown(
+        metric_card(f"Sell fees ({m['sellCount']} sells)", fmt_money(m["sellFeesTotal"], 2)),
+        unsafe_allow_html=True,
+    )
+    f3.markdown(
+        metric_card("Demat AMC & charges", fmt_money(m["chargesTotal"], 2)),
+        unsafe_allow_html=True,
+    )
+    with st.expander("Fee breakdown detail"):
+        fees_detail = [
+            ("Brokerage on buys",     m["buyBrokerage"]),
+            ("Statutory on buys",     m["buyTax"]),
+            ("Brokerage on sells",    m["sellBrokerage"]),
+            ("Statutory on sells",    m["sellTax"]),
+            ("Dividend paid to self", m["sellDividend"]),
+            ("Demat AMC & charges",   m["chargesTotal"]),
+        ]
+        dc = st.columns(len(fees_detail))
+        for col, (label, val) in zip(dc, fees_detail):
+            col.markdown(metric_card(label, fmt_money(val, 2)), unsafe_allow_html=True)
 
-    # ── Verify the totals (ledger style) ──────────────────────────────────
+    # ── Chapter 4 — Verify the totals ────────────────────────────────────
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
     section("Verify the totals")
 
@@ -2005,130 +2178,37 @@ def page_reports() -> None:
             _guard = "_op_done_fix_reconcile"
             if not st.session_state.get(_guard):
                 st.session_state[_guard] = True
-                updated_user, adj = dm.fix_reconciliation_drift(
-                    st.session_state.user, buys, sells, holdings, etfs, charges
-                )
+                adj = m["reconcileDiff"]
+                updated_user = st.session_state.user
+                updated_user.remainingAmount -= adj
+                dm.save_user(updated_user)
                 st.session_state.user = updated_user
                 st.toast(f"✅ Remaining Amount adjusted by ₹{-adj:+.4f} — books balanced.", icon="🔧")
                 st.rerun()
 
-    # ── Fees breakdown (cards) ────────────────────────────────────────────
+    # ── Chapter 5 — Month by month ───────────────────────────────────────
     st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-    section("What made up the fees")
-    fees_items = [
-        ("Brokerage on buys",         m["buyBrokerage"]),
-        ("Statutory on buys",         m["buyTax"]),
-        ("Brokerage on sells",        m["sellBrokerage"]),
-        ("Statutory on sells",        m["sellTax"]),
-        ("Dividend paid to self",     m["sellDividend"]),
-        ("Demat AMC & charges",       m["chargesTotal"]),
-    ]
-    cols = st.columns(len(fees_items))
-    for col, (label, val) in zip(cols, fees_items):
-        col.markdown(metric_card(label, fmt_money(val, 2)), unsafe_allow_html=True)
-    total_consumed = m["moneyConsumed"] + m["chargesTotal"]
-    st.markdown(
-        f'<div style="text-align:right;margin-top:6px;font-size:0.85rem">'
-        f'Total money consumed &nbsp;<b>{fmt_money(total_consumed, 2)}</b></div>',
-        unsafe_allow_html=True,
-    )
+    with st.expander("Month by month"):
+        monthly = dm.money_by_month(dm.load_buys(), dm.load_sells())
+        if monthly.empty:
+            st.info("No transactions yet.")
+        else:
+            mv = monthly.copy()
+            mv.columns = ["Month", "Spent on buys", "Buy fees",
+                          "Got from sells", "Sell fees", "Dividend out", "Net flow"]
+            st.dataframe(
+                mv, use_container_width=True, hide_index=True,
+                column_config={
+                    "Spent on buys":  st.column_config.NumberColumn(format="₹%.2f"),
+                    "Buy fees":       st.column_config.NumberColumn(format="₹%.4f"),
+                    "Got from sells": st.column_config.NumberColumn(format="₹%.2f"),
+                    "Sell fees":      st.column_config.NumberColumn(format="₹%.4f"),
+                    "Dividend out":   st.column_config.NumberColumn(format="₹%.2f"),
+                    "Net flow":       st.column_config.NumberColumn(format="₹%.2f"),
+                },
+            )
 
-    # ── Per-ETF breakdown ─────────────────────────────────────────────────
-    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-    section("Where the money went (per ETF)")
-    per_etf = dm.money_by_etf(buys, sells, holdings, etfs)
-    if per_etf.empty:
-        st.info("No transactions yet.")
-    else:
-        show = per_etf[[
-            "etfName", "etfType",
-            "buyOutflow", "sellInflow",
-            "heldQty", "costBasis", "currentValue", "unrealizedPL",
-            "sellNetPL", "netInvested",
-        ]].copy()
-        show.columns = [
-            "ETF", "Type",
-            "Spent", "Received",
-            "Held Qty", "In holdings", "Worth now", "Unrealized P/L",
-            "Realized P/L", "Net invested",
-        ]
-        st.dataframe(
-            show, use_container_width=True, hide_index=True,
-            column_config={
-                "Spent":           st.column_config.NumberColumn(format="₹%.2f"),
-                "Received":        st.column_config.NumberColumn(format="₹%.2f"),
-                "Held Qty":        st.column_config.NumberColumn(format="%.0f"),
-                "In holdings":     st.column_config.NumberColumn(format="₹%.2f"),
-                "Worth now":       st.column_config.NumberColumn(format="₹%.2f"),
-                "Unrealized P/L":  st.column_config.NumberColumn(format="₹%.2f"),
-                "Realized P/L":    st.column_config.NumberColumn(format="₹%.2f"),
-                "Net invested":    st.column_config.NumberColumn(format="₹%.2f"),
-            },
-        )
-        st.caption(
-            f"Totals — spent {fmt_money(per_etf['buyOutflow'].sum(), 2)} · "
-            f"received {fmt_money(per_etf['sellInflow'].sum(), 2)} · "
-            f"net invested {fmt_money(per_etf['netInvested'].sum(), 2)} · "
-            f"current value {fmt_money(per_etf['currentValue'].sum(), 2)}"
-        )
-
-    # ── Allocation by type (cards) ────────────────────────────────────────
-    alloc = dm.holdings_by_type(holdings, etfs)
-    if not alloc.empty:
-        st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-        section("By type (current holdings)")
-        for _, row in alloc.iterrows():
-            pnl_c = "#2ecc71" if float(row["pnl"]) >= 0 else "#e74c3c"
-            with st.container(border=True):
-                t1, t2, t3, t4, t5 = st.columns([2, 2, 2, 2, 2])
-                t1.markdown(
-                    f'<div class="text-muted" style="font-size:0.7rem">TYPE</div>'
-                    f'<div style="font-weight:700;font-size:1rem">{row["etfType"]}</div>'
-                    f'<div class="text-muted" style="font-size:0.78rem">{int(row["count"])} holdings</div>',
-                    unsafe_allow_html=True,
-                )
-                t2.markdown(
-                    f'<div class="text-muted" style="font-size:0.7rem">INVESTED</div>'
-                    f'<div style="font-size:1rem;font-weight:600">{fmt_money(float(row["cost"]))}</div>',
-                    unsafe_allow_html=True,
-                )
-                t3.markdown(
-                    f'<div class="text-muted" style="font-size:0.7rem">WORTH NOW</div>'
-                    f'<div style="font-size:1rem;font-weight:600">{fmt_money(float(row["currentValue"]))}</div>',
-                    unsafe_allow_html=True,
-                )
-                t4.markdown(
-                    f'<div class="text-muted" style="font-size:0.7rem">UNREALIZED P/L</div>'
-                    f'<div style="font-size:1rem;font-weight:600;color:{pnl_c}">{fmt_money(float(row["pnl"]))}</div>',
-                    unsafe_allow_html=True,
-                )
-                t5.markdown(
-                    f'<div class="text-muted" style="font-size:0.7rem">P/L %</div>'
-                    f'<div style="font-size:1rem;font-weight:600;color:{pnl_c}">{float(row["pnlPct"]):+.2f}%</div>',
-                    unsafe_allow_html=True,
-                )
-
-    # ── Month by month ────────────────────────────────────────────────────
-    monthly = dm.money_by_month(buys, sells)
-    if not monthly.empty:
-        st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
-        section("Month by month")
-        mv = monthly.copy()
-        mv.columns = ["Month", "Spent on buys", "Buy fees",
-                      "Got from sells", "Sell fees", "Dividend out", "Net flow"]
-        st.dataframe(
-            mv, use_container_width=True, hide_index=True,
-            column_config={
-                "Spent on buys":  st.column_config.NumberColumn(format="₹%.2f"),
-                "Buy fees":       st.column_config.NumberColumn(format="₹%.4f"),
-                "Got from sells": st.column_config.NumberColumn(format="₹%.2f"),
-                "Sell fees":      st.column_config.NumberColumn(format="₹%.4f"),
-                "Dividend out":   st.column_config.NumberColumn(format="₹%.2f"),
-                "Net flow":       st.column_config.NumberColumn(format="₹%.2f"),
-            },
-        )
-
-    if r["holdingsCount"] > 20:
+    if len(holdings) > 20:
         st.warning("⚠️ Holdings count exceeds 20.")
 
 
@@ -2416,6 +2496,33 @@ def page_settings() -> None:
                     _set_session_token(h)
                     st.toast("🔒 Password enabled", icon="✅")
                     st.rerun()
+
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+    section("Maintenance")
+    with st.container(border=True):
+        st.markdown("**🔄 Rebuild summary stats**")
+        st.caption(
+            "Recomputes the `meta/stats` aggregate from all transactions. "
+            "Run this once after upgrading, or if the Avg Hold Time metric looks wrong."
+        )
+        if st.button("🔄 Rebuild stats", type="secondary", key="rebuild_stats_btn"):
+            with st.spinner("Scanning all transactions…"):
+                s = dm.rebuild_stats()
+            st.success(
+                f"Done — {s['buyCount']} buys · {s['sellCount']} sells · "
+                f"openInvTotal ₹{s['openInvTotal']:,.0f}"
+            )
+
+    with st.container(border=True):
+        st.markdown("**📅 Backfill sell holding days**")
+        st.caption(
+            "Computes the exact weighted-avg holding time for all existing sell records "
+            "and stamps it permanently. Run once after upgrading."
+        )
+        if st.button("📅 Backfill holding days", type="secondary", key="backfill_hd_btn"):
+            with st.spinner("Computing holding days for existing sells…"):
+                n = dm.backfill_sell_holding_days()
+            st.success(f"Done — updated {n} sell record(s).")
 
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
     section("Danger zone")

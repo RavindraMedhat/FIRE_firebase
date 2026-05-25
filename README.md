@@ -13,12 +13,15 @@ Data is stored in **Firebase Firestore** — visible live at [console.firebase.g
 
 - **8-page app**: Home, Suggestions, Listed ETFs, Transactions, Sell History, Reports, Settings, Info
 - Track ETF and stock holdings with weighted-average price, quantity, and P&L
+- **Per-lot weighted-average holding time** on every holding card — computed from actual buy records, not just last purchase date
 - Log every buy and sell with automatic Kotak Securities charge calculation
-- Portfolio dashboard: allocation cards, 3-tab holdings filter, recent activity
+- Portfolio dashboard: allocation cards, 3-tab holdings filter, recent activity (paginated — 5 docs, no full scan)
 - Buy/sell suggestions based on 20-DMA dip — fresh picks + buyback candidates
-- Sell history with per-sell formula cards and reversal support
+- Sell history with per-sell formula cards, per-sell `holdingDays` stamped permanently at sell time, and reversal support
 - Transactions log: paginated buy / sell / charges / cashflow tabs with date filter
-- Reports: ledger reconciliation, fee breakdown, per-ETF flow, month-wise summary
+- **Reports**: 5-chapter storytelling layout — headline, how money is working, what it cost, ledger verification, month-by-month
+- **`meta/stats` running totals**: incremented on every write — Reports loads with 1 Firestore read, no full collection scans
+- **O(1) Firestore writes**: all buy/sell/delete paths use surgical document ops, never bulk replace
 - Demat AMC auto-deduction every 30 days (logged to `charges` collection)
 - Deposit / withdrawal tracking with full cashflow history
 - Password-protected login — HMAC-SHA256 session tokens, 7-hour expiry
@@ -60,9 +63,10 @@ FIRE/
 |------|---------------|
 | `meta/user` | User settings — investment, remaining cash, thresholds, AMC config |
 | `meta/config` | App password hash (HMAC-SHA256 key) |
+| `meta/stats` | Running totals — buy/sell counts, gross amounts, charges, open inv sum — updated on every write; enables O(1) Reports |
 | `holdings/{id}` | Open positions — one document per ETF/stock held |
 | `buys/{id}` | Buy transaction log — one document per buy event |
-| `sells/{id}` | Sell transaction log — one document per sell event |
+| `sells/{id}` | Sell transaction log — includes `holdingDays` stamped permanently at sell time |
 | `charges/{id}` | Non-trade charges — Demat AMC, DP fees, manual entries |
 | `cashflow/{id}` | Deposit / withdrawal log — every bank transfer in or out |
 

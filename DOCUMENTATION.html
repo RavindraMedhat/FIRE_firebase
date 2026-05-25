@@ -416,9 +416,10 @@
         <tr><th>Path</th><th>What it stores</th></tr>
         <tr><td><code>meta/user</code></td><td>User profile + settings — investment, remaining cash, thresholds, AMC config</td></tr>
         <tr><td><code>meta/config</code></td><td>App password hash (HMAC-SHA256 key)</td></tr>
+        <tr><td><code>meta/stats</code></td><td>Running totals — incremented on every buy/sell/charge; enables O(1) Reports page without full collection scans</td></tr>
         <tr><td><code>holdings/{id}</code></td><td>Open positions — one document per ETF / stock currently held</td></tr>
         <tr><td><code>buys/{id}</code></td><td>Full buy transaction log — one document per buy event</td></tr>
-        <tr><td><code>sells/{id}</code></td><td>Full sell transaction log — one document per sell event</td></tr>
+        <tr><td><code>sells/{id}</code></td><td>Full sell transaction log — one document per sell event (includes <code>holdingDays</code> stamped at sell time)</td></tr>
         <tr><td><code>charges/{id}</code></td><td>Non-trade charges — Demat AMC, DP fees, any manual charge entries</td></tr>
         <tr><td><code>cashflow/{id}</code></td><td>Deposit / withdrawal log — every bank transfer in or out</td></tr>
       </table>
@@ -476,6 +477,26 @@
         <tr><td><code>tax</code></td><td>STT + exchange + SEBI + GST bundled</td></tr>
         <tr><td><code>dividendPaidToSelf</code></td><td>Personal savings cut from this sell</td></tr>
         <tr><td><code>lastPurchaseDate, sellDate</code></td><td>ISO timestamps</td></tr>
+        <tr><td><code>holdingDays</code></td><td>Weighted-average holding duration in days — computed from actual buy lots at sell time and stamped permanently. Formula: <code>Σ(price × qty × days) / Σ(price × qty)</code></td></tr>
+      </table>
+
+      <h3>meta/stats — running totals</h3>
+      <p>Single document updated incrementally on every buy, sell, and charge. Enables the Reports page to load with 1 Firestore read instead of scanning all collections. <code>rebuild_stats()</code> in Settings reconstructs it from scratch if ever needed.</p>
+      <table>
+        <tr><th>Field</th><th>Meaning</th></tr>
+        <tr><td><code>buyCount</code></td><td>Total number of buy transactions</td></tr>
+        <tr><td><code>buyGross</code></td><td>Σ (price × qty) across all buys — before charges</td></tr>
+        <tr><td><code>buyBrokerage</code></td><td>Σ brokerage paid on buys</td></tr>
+        <tr><td><code>buyTotalCharges</code></td><td>Σ all charges on buys (brokerage + tax)</td></tr>
+        <tr><td><code>sellCount</code></td><td>Total number of sell transactions</td></tr>
+        <tr><td><code>sellGross</code></td><td>Σ (sell price × qty) across all sells — before charges</td></tr>
+        <tr><td><code>sellBrokerage</code></td><td>Σ brokerage paid on sells</td></tr>
+        <tr><td><code>sellTotalCharges</code></td><td>Σ all charges on sells</td></tr>
+        <tr><td><code>sellNetPL</code></td><td>Σ realized net P&amp;L across all sells</td></tr>
+        <tr><td><code>sellDividend</code></td><td>Σ dividend paid to self on sells</td></tr>
+        <tr><td><code>chargesTotal</code></td><td>Σ amounts from charges collection (AMC + manual)</td></tr>
+        <tr><td><code>openInvTotal</code></td><td>Σ (price × qty) for currently open buy lots — used for weighted avg hold time</td></tr>
+        <tr><td><code>openInvDateSum</code></td><td>Σ (price × qty × buyDate_epoch) — used to compute weighted avg buy date for open positions</td></tr>
       </table>
 
       <h3>charges/{id}</h3>
@@ -683,6 +704,11 @@ net_pl     = gross_pl − brokerage − tax − dividend_paid_to_self</code></pr
           </div>
         </div>
         <div class="arrow">↓</div>
+        <div class="flow-box">
+          <div class="title">_update_stats(delta) → <code>meta/stats</code></div>
+          <div class="sub">Increment buyCount, buyGross, buyTotalCharges, openInvTotal, openInvDateSum</div>
+        </div>
+        <div class="arrow">↓</div>
         <div class="flow-box"><div class="title">Regenerate suggestions</div></div>
       </div>
 
@@ -696,7 +722,12 @@ net_pl     = gross_pl − brokerage − tax − dividend_paid_to_self</code></pr
         <div class="arrow">↓</div>
         <div class="flow-box accent"><div class="title">sell_holding(...) → Firestore</div></div>
         <div class="arrow">↓</div>
-        <div class="flow-box"><div class="title">Write to <code>sells/{uuid}</code></div></div>
+        <div class="flow-box">
+          <div class="title">Compute holdingDays</div>
+          <div class="sub">Load buy lots for this holding → weighted avg: <code>Σ(price×qty×days) / Σ(price×qty)</code> → stamp on sell record</div>
+        </div>
+        <div class="arrow">↓</div>
+        <div class="flow-box"><div class="title">Write to <code>sells/{uuid}</code></div><div class="sub">includes holdingDays field</div></div>
         <div class="arrow">↓</div>
         <div class="flow-box">
           <div class="title">Update <code>holdings/{id}</code></div>
@@ -709,6 +740,11 @@ net_pl     = gross_pl − brokerage − tax − dividend_paid_to_self</code></pr
             <code>remainingAmount += (sell_value − charges − dividend)</code><br>
             <code>investment += net_pl</code>  &nbsp;(= gross_pl − charges − dividend)
           </div>
+        </div>
+        <div class="arrow">↓</div>
+        <div class="flow-box">
+          <div class="title">_update_stats(delta) → <code>meta/stats</code></div>
+          <div class="sub">Increment sellCount, sellGross, sellNetPL, sellTotalCharges; decrement openInvTotal, openInvDateSum</div>
         </div>
       </div>
     </section>
@@ -726,7 +762,7 @@ net_pl     = gross_pl − brokerage − tax − dividend_paid_to_self</code></pr
             <li><strong>🟢 Sell</strong> — above profit target</li>
             <li><strong>🔴 Buy more</strong> — below dip threshold</li>
           </ul>
-          <p>Each holding card shows avg price, CMP, qty, cost, value, and P/L. Inline sell and buy-more forms open on click. Recent activity (last 5 buys + sells) shown at top.</p>
+          <p>Each holding card shows avg price, CMP, qty, cost, value, P/L, and <strong>weighted-average hold time</strong> computed per lot from actual buy records. Inline sell and buy-more forms open on click. Recent activity (last 5 buys + sells) shown at top using paginated Firestore fetch.</p>
         </div>
 
         <div class="card">
@@ -763,20 +799,19 @@ net_pl     = gross_pl − brokerage − tax − dividend_paid_to_self</code></pr
 
         <div class="card">
           <h3 style="margin-top:0">📊 Reports</h3>
-          <p>Eight report sections:</p>
+          <p>5-chapter storytelling layout — all data loaded from <code>meta/stats</code> in one read:</p>
           <ul>
-            <li>Portfolio snapshot (4 key metrics)</li>
-            <li>Ledger reconciliation (expected vs actual balance, ✓/✗)</li>
-            <li>Fees breakdown (brokerage, statutory, AMC, dividend)</li>
-            <li>Per-ETF money flow table</li>
-            <li>By type: Equity / Jewellery / Stocks allocation</li>
-            <li>Month-by-month flow table</li>
+            <li><strong>Chapter 1 — The headline</strong>: deployed capital, current direction (up/down), total return %, sub-line with holdings · cash · avg hold days</li>
+            <li><strong>Chapter 2 — How the money is working</strong>: two panels — "Still in market" (cost basis → worth now → unrealized P/L) and "Already sold" (gross sold → net profit)</li>
+            <li><strong>Chapter 3 — What it cost you</strong>: total fees sentence, 3 cards (buy fees, sell fees, demat AMC), collapsible full breakdown</li>
+            <li><strong>Chapter 4 — Verify the totals</strong>: ledger reconciliation (expected vs actual balance, ✓/✗ with one-click fix)</li>
+            <li><strong>Chapter 5 — Month by month</strong>: collapsible table of buys, sells, fees, net flow per month</li>
           </ul>
         </div>
 
         <div class="card">
           <h3 style="margin-top:0">⚙️ Settings</h3>
-          <p>Eight sections: Appearance (theme toggle), Profile, Investment thresholds, Sell profit target, Buy dip threshold, Dividend %, AMC config. Three action tabs: Deposit, Withdraw, Add Manual Charge.</p>
+          <p>Sections: Appearance (theme toggle), Profile, Capital (investment + remaining cash), Thresholds (sell target, dip threshold, dividend %), AMC config. Three action tabs: Deposit, Withdraw, Add Manual Charge. <strong>Maintenance</strong> section at bottom with two admin actions: <em>Rebuild stats</em> (full rescan to rebuild <code>meta/stats</code>) and <em>Backfill holding days</em> (stamps holdingDays on existing sell records).</p>
         </div>
 
         <div class="card">
@@ -800,22 +835,31 @@ net_pl     = gross_pl − brokerage − tax − dividend_paid_to_self</code></pr
         <tr><td><code>init_firebase()</code></td><td>Initialise firebase-admin SDK; picks service account from file (local) or <code>st.secrets</code> (cloud)</td></tr>
         <tr><td><code>load_user() / save_user()</code></td><td>Read / write <code>meta/user</code> as <code>UserSettings</code> dataclass</td></tr>
         <tr><td><code>load_holdings() / save_holding()</code></td><td>Load all holdings or upsert a single document</td></tr>
-        <tr><td><code>load_buys() / load_sells()</code></td><td>Load full buy / sell history into DataFrames</td></tr>
+        <tr><td><code>load_buys() / load_sells()</code></td><td>Load full buy / sell history into DataFrames (with in-process cache)</td></tr>
         <tr><td><code>load_charges() / load_cashflow()</code></td><td>Load charges and cashflow collections</td></tr>
+        <tr><td><code>fetch_buys_page() / fetch_sells_page()</code></td><td>Cursor-based paginated fetch — used for Recent Activity (5 docs) and Transactions page</td></tr>
+        <tr><td><code>load_stats()</code></td><td>Read <code>meta/stats</code>; auto-calls <code>rebuild_stats()</code> if doc doesn't exist</td></tr>
+        <tr><td><code>rebuild_stats()</code></td><td>Full rescan of all buys/sells/charges → recomputes and writes <code>meta/stats</code> from scratch</td></tr>
+        <tr><td><code>_update_stats(delta)</code></td><td>Atomic read-modify-write on <code>meta/stats</code>; called on every buy, sell, and charge event</td></tr>
+        <tr><td><code>_add_document(col, data)</code></td><td>Write one document to Firestore (O(1) — replaces bulk _replace_collection pattern)</td></tr>
+        <tr><td><code>_delete_document(col, id)</code></td><td>Delete one document by ID (O(1))</td></tr>
+        <tr><td><code>_delete_where(col, field, value)</code></td><td>Delete all docs in a collection where field == value (used for delete_holding cleanup)</td></tr>
+        <tr><td><code>_clear_collection(col)</code></td><td>Delete all documents in a collection (used for reset_all_transactions)</td></tr>
         <tr><td><code>fetch_etfs()</code></td><td>Hit Google Apps Script API, filter <code>cmp &gt; 0</code>, write cache</td></tr>
         <tr><td><code>load_etfs_cache()</code></td><td>Read local <code>etfs_cache.csv</code> as offline fallback</td></tr>
         <tr><td><code>compute_kotak_charges(value, type, side)</code></td><td>Returns full itemized fee breakdown dict</td></tr>
-        <tr><td><code>buy_etf(...)</code></td><td>Execute buy: write buys doc, upsert holding, update user; returns charges dict</td></tr>
-        <tr><td><code>sell_holding(...)</code></td><td>Execute sell: write sells doc, update/delete holding, update user; returns charges dict</td></tr>
-        <tr><td><code>reverse_sell(...)</code></td><td>Undo a sell: delete sells doc, restore holding qty, reverse user balance changes</td></tr>
+        <tr><td><code>buy_etf(...)</code></td><td>Execute buy: write buys doc, upsert holding, update user, update stats; returns charges dict</td></tr>
+        <tr><td><code>sell_holding(...)</code></td><td>Execute sell: compute holdingDays from buy lots, write sells doc (with holdingDays), update/delete holding, update user, update stats</td></tr>
+        <tr><td><code>reverse_sell(...)</code></td><td>Undo a sell: delete sells doc, restore holding qty, reverse user balance changes, reverse stats delta</td></tr>
+        <tr><td><code>backfill_sell_holding_days()</code></td><td>One-time: stamp holdingDays onto all existing sell records that are missing it (matches buys by etfName + date)</td></tr>
         <tr><td><code>generate_suggestions(holdings, etfs, user)</code></td><td>Run the dip-based suggestion algorithm; returns fresh picks + buybacks</td></tr>
         <tr><td><code>classify_holdings(holdings, etfs, user)</code></td><td>Split holdings into sell / buy-more / others groups</td></tr>
-        <tr><td><code>compute_report(holdings, sells, etfs)</code></td><td>Aggregate portfolio %, realized P/L, fee totals</td></tr>
-        <tr><td><code>compute_money_summary(user, buys, sells, holdings, etfs)</code></td><td>Full ledger reconciliation dict</td></tr>
+        <tr><td><code>compute_money_summary_from_stats(user, holdings, etfs)</code></td><td><strong>Fast path</strong> — reads only <code>meta/stats</code> (1 doc); used by Reports page. Same dict shape as <code>compute_money_summary</code>.</td></tr>
+        <tr><td><code>compute_money_summary(user, buys, sells, holdings, etfs)</code></td><td>Full ledger reconciliation dict — scans all collections; used when full accuracy over stats is needed</td></tr>
+        <tr><td><code>compute_holding_time_stats(holdings, sells, buys)</code></td><td>Returns weighted avg hold days for open positions and per-ETF holdingDays for sell history</td></tr>
         <tr><td><code>money_by_etf(buys, sells, holdings, etfs)</code></td><td>Per-ETF outflow/inflow/P&amp;L breakdown DataFrame</td></tr>
         <tr><td><code>money_by_month(buys, sells)</code></td><td>Month-wise flow DataFrame</td></tr>
-        <tr><td><code>check_and_apply_amc(user)</code></td><td>Auto-deduct AMC if 30 days have passed; write charges doc</td></tr>
-        <tr><td><code>fix_reconciliation_drift(user, buys, sells, holdings, etfs)</code></td><td>Recompute correct <code>remainingAmount</code> and patch Firestore</td></tr>
+        <tr><td><code>check_and_apply_amc(user)</code></td><td>Auto-deduct AMC if 30 days have passed; write charges doc; update stats</td></tr>
         <tr><td><code>paginate_buys/sells/charges/cashflow()</code></td><td>Cursor-based Firestore pagination with total count</td></tr>
       </table>
 

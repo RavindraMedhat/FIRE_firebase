@@ -39,6 +39,18 @@ if not firebase_admin._apps:
 
 db: firestore.Client = firestore.client()
 
+# ── In-process data cache ────────────────────────────────────────────────────
+# Holds full DataFrames for holdings/buys/sells/charges/cashflow so multiple
+# pages in the same Streamlit session share one Firestore round-trip.
+# Cleared automatically by every save_* function after any write.
+_DATA_CACHE: dict = {}
+
+
+def clear_data_cache() -> None:
+    """Invalidate all cached collection DataFrames. Called by every write."""
+    _DATA_CACHE.clear()
+
+
 # ── ETF cache stays local ────────────────────────────────────────────────────
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
@@ -123,6 +135,7 @@ SELL_COLUMNS = [
     "dividendPaidToSelf",
     "lastPurchaseDate",
     "sellDate",
+    "holdingDays",   # weighted avg hold days across all buy lots — stamped at sell time
 ]
 
 BUY_COLUMNS = [
@@ -196,7 +209,8 @@ def _collection_to_df(col_name: str, columns: list[str]) -> pd.DataFrame:
 
 
 def _replace_collection(col_name: str, df: pd.DataFrame, id_field: str) -> None:
-    """Delete all existing docs then write every row in df."""
+    """Delete all existing docs then write every row in df.
+    Only used for small collections (holdings, ≤30 docs) where full replace is safe."""
     col_ref = db.collection(col_name)
     existing = list(col_ref.stream())
     batch = db.batch()
@@ -206,6 +220,141 @@ def _replace_collection(col_name: str, df: pd.DataFrame, id_field: str) -> None:
         data = _clean_row(row.to_dict())
         batch.set(col_ref.document(str(data[id_field])), data)
     batch.commit()
+    _DATA_CACHE.pop(col_name, None)
+
+
+def _add_document(col_name: str, row: dict) -> None:
+    """Write one new document. O(1) — always one Firestore write regardless of collection size."""
+    db.collection(col_name).document(str(row["id"])).set(_clean_row(row))
+    # Append to in-memory cache if it exists so the next read doesn't need a round-trip
+    if col_name in _DATA_CACHE:
+        _DATA_CACHE[col_name] = pd.concat(
+            [_DATA_CACHE[col_name], pd.DataFrame([row])], ignore_index=True
+        )
+
+
+def _delete_document(col_name: str, doc_id: str) -> None:
+    """Delete one document by ID. O(1) — always one Firestore delete."""
+    db.collection(col_name).document(doc_id).delete()
+    if col_name in _DATA_CACHE:
+        cache = _DATA_CACHE[col_name]
+        _DATA_CACHE[col_name] = cache[cache["id"] != doc_id].reset_index(drop=True)
+
+
+def _delete_where(col_name: str, field: str, value: str) -> None:
+    """Delete all documents where field == value."""
+    docs = list(db.collection(col_name).where(field, "==", value).stream())
+    if docs:
+        batch = db.batch()
+        for doc in docs:
+            batch.delete(doc.reference)
+        batch.commit()
+    if col_name in _DATA_CACHE:
+        cache = _DATA_CACHE[col_name]
+        _DATA_CACHE[col_name] = cache[cache[field] != value].reset_index(drop=True)
+
+
+def _clear_collection(col_name: str) -> None:
+    """Delete every document in a collection in batches of 400."""
+    col_ref = db.collection(col_name)
+    while True:
+        docs = list(col_ref.limit(400).stream())
+        if not docs:
+            break
+        batch = db.batch()
+        for doc in docs:
+            batch.delete(doc.reference)
+        batch.commit()
+    _DATA_CACHE.pop(col_name, None)
+
+
+# ── Running stats (meta/stats) ────────────────────────────────────────────────
+# Precomputed aggregates so the home page never needs to load buys/sells in full.
+# Updated incrementally on every write; rebuilt from scratch on first use.
+
+STATS_DEFAULTS: dict = {
+    "buyCount": 0,
+    "buyGross": 0.0,          # Σ(price × qty)
+    "buyBrokerage": 0.0,      # Σ(brokerage) on buys
+    "buyTotalCharges": 0.0,   # Σ(totalCharges) on buys
+    "sellCount": 0,
+    "sellGross": 0.0,         # Σ(sellPrice × qty)
+    "sellBrokerage": 0.0,     # Σ(brokerage) on sells
+    "sellNetPL": 0.0,
+    "sellTotalCharges": 0.0,  # Σ(brokerage + tax) on sells
+    "sellDividend": 0.0,
+    "chargesTotal": 0.0,      # Σ(charges.amount)
+    # For weighted-avg hold days without loading all buys:
+    # avgHoldDays ≈ today_epoch_days − openInvDateSum / openInvTotal
+    "openInvTotal": 0.0,      # Σ(price × qty) for all open buy lots
+    "openInvDateSum": 0.0,    # Σ(price × qty × epoch_days_of_buyDate)
+}
+
+
+def load_stats() -> dict:
+    doc = db.collection("meta").document("stats").get()
+    if not doc.exists:
+        return rebuild_stats()
+    d = doc.to_dict() or {}
+    return {k: d.get(k, v) for k, v in STATS_DEFAULTS.items()}
+
+
+def _update_stats(delta: dict) -> None:
+    doc_ref = db.collection("meta").document("stats")
+    existing = doc_ref.get()
+    current = existing.to_dict() if existing.exists else dict(STATS_DEFAULTS)
+    for k, v in delta.items():
+        current[k] = float(current.get(k, 0.0)) + float(v)
+    doc_ref.set(current)
+
+
+def rebuild_stats() -> dict:
+    """Full rescan of all collections to recompute stats. Called on first use or to repair."""
+    buys = _collection_to_df("buys", BUY_COLUMNS)
+    sells = _collection_to_df("sells", SELL_COLUMNS)
+    charges_df = _collection_to_df("charges", CHARGE_COLUMNS)
+    holdings = _collection_to_df("holdings", HOLDING_COLUMNS)
+
+    stats = dict(STATS_DEFAULTS)
+    epoch = date(1970, 1, 1)
+    today = date.today()
+
+    if not buys.empty:
+        stats["buyCount"] = len(buys)
+        stats["buyGross"] = float((buys["price"].astype(float) * buys["quantity"].astype(float)).sum())
+        stats["buyBrokerage"] = float(buys["brokerageCharges"].astype(float).sum())
+        stats["buyTotalCharges"] = float(buys["totalCharges"].astype(float).sum())
+
+        active_ids = set(holdings["id"].astype(str).tolist()) if not holdings.empty else set()
+        open_buys = buys[buys["holdingId"].isin(active_ids)] if active_ids else pd.DataFrame()
+        for _, b in (open_buys.iterrows() if not open_buys.empty else []):
+            inv = float(b["price"]) * float(b["quantity"])
+            try:
+                ep_days = (pd.to_datetime(b["buyDate"]).date() - epoch).days
+            except Exception:
+                ep_days = (today - epoch).days
+            stats["openInvTotal"] += inv
+            stats["openInvDateSum"] += inv * ep_days
+
+    if not sells.empty:
+        q  = sells["quantity"].astype(float)
+        sp = sells["sellPrice"].astype(float)
+        ap = sells["averagePurchasePrice"].astype(float)
+        br = sells["brokerageCharges"].astype(float)
+        tx = sells["tax"].astype(float)
+        dv = sells["dividendPaidToSelf"].astype(float)
+        stats["sellCount"] = len(sells)
+        stats["sellGross"] = float((sp * q).sum())
+        stats["sellBrokerage"] = float(br.sum())
+        stats["sellNetPL"] = float(((sp - ap) * q - br - tx - dv).sum())
+        stats["sellTotalCharges"] = float((br + tx).sum())
+        stats["sellDividend"] = float(dv.sum())
+
+    if not charges_df.empty:
+        stats["chargesTotal"] = float(charges_df["amount"].astype(float).sum())
+
+    db.collection("meta").document("stats").set(stats)
+    return stats
 
 
 # ── Config (password) ────────────────────────────────────────────────────────
@@ -271,7 +420,9 @@ def save_user(u: UserSettings) -> None:
 
 
 def load_charges() -> pd.DataFrame:
-    return _collection_to_df("charges", CHARGE_COLUMNS)
+    if "charges" not in _DATA_CACHE:
+        _DATA_CACHE["charges"] = _collection_to_df("charges", CHARGE_COLUMNS)
+    return _DATA_CACHE["charges"]
 
 
 def fetch_charges_page(page_size: int, cursor=None) -> tuple[pd.DataFrame, object]:
@@ -318,10 +469,14 @@ def save_charge(charge_type: str, amount: float, description: str, charge_date: 
         "chargeDate": charge_date or _now_iso(),
     }
     db.collection("charges").document(row["id"]).set(row)
+    _update_stats({"chargesTotal": amount})
+    clear_data_cache()
 
 
 def load_cashflow() -> pd.DataFrame:
-    return _collection_to_df("cashflow", CASHFLOW_COLUMNS)
+    if "cashflow" not in _DATA_CACHE:
+        _DATA_CACHE["cashflow"] = _collection_to_df("cashflow", CASHFLOW_COLUMNS)
+    return _DATA_CACHE["cashflow"]
 
 
 def fetch_cashflow_page(page_size: int, cursor=None) -> tuple[pd.DataFrame, object]:
@@ -368,6 +523,7 @@ def save_cashflow(txn_type: str, amount: float, txn_date: str | None = None, not
         "note": note,
     }
     db.collection("cashflow").document(row["id"]).set(row)
+    clear_data_cache()
 
 
 def check_and_apply_amc(user: UserSettings) -> tuple[UserSettings, float]:
@@ -399,7 +555,9 @@ def check_and_apply_amc(user: UserSettings) -> tuple[UserSettings, float]:
 # ── Holdings ──────────────────────────────────────────────────────────────────
 
 def load_holdings() -> pd.DataFrame:
-    return _collection_to_df("holdings", HOLDING_COLUMNS)
+    if "holdings" not in _DATA_CACHE:
+        _DATA_CACHE["holdings"] = _collection_to_df("holdings", HOLDING_COLUMNS)
+    return _DATA_CACHE["holdings"]
 
 
 def save_holdings(df: pd.DataFrame) -> None:
@@ -409,7 +567,9 @@ def save_holdings(df: pd.DataFrame) -> None:
 # ── Sells ────────────────────────────────────────────────────────────────────
 
 def load_sells() -> pd.DataFrame:
-    return _collection_to_df("sells", SELL_COLUMNS)
+    if "sells" not in _DATA_CACHE:
+        _DATA_CACHE["sells"] = _collection_to_df("sells", SELL_COLUMNS)
+    return _DATA_CACHE["sells"]
 
 
 def fetch_sells_page(page_size: int, cursor=None) -> tuple[pd.DataFrame, object]:
@@ -437,7 +597,9 @@ def save_sells(df: pd.DataFrame) -> None:
 # ── Buys ─────────────────────────────────────────────────────────────────────
 
 def load_buys() -> pd.DataFrame:
-    return _collection_to_df("buys", BUY_COLUMNS)
+    if "buys" not in _DATA_CACHE:
+        _DATA_CACHE["buys"] = _collection_to_df("buys", BUY_COLUMNS)
+    return _DATA_CACHE["buys"]
 
 
 def fetch_buys_page(page_size: int, cursor=None) -> tuple[pd.DataFrame, object]:
@@ -551,10 +713,63 @@ def backfill_buys_from_holdings() -> int:
             "totalCharges": 0.0,
             "buyDate": str(h["lastPurchaseDate"]) if pd.notna(h.get("lastPurchaseDate")) else _now_iso(),
         })
-    if new_rows:
-        buys = pd.concat([buys, pd.DataFrame(new_rows)], ignore_index=True)
-        save_buys(buys)
+    for row in new_rows:
+        _add_document("buys", row)
     return len(new_rows)
+
+
+def backfill_sell_holding_days() -> int:
+    """Compute and stamp holdingDays into every sell record that is missing it.
+    Uses all buy lots for that ETF where buyDate <= sellDate — same formula as
+    sell_holding() uses going forward."""
+    sells = _collection_to_df("sells", SELL_COLUMNS)
+    if sells.empty:
+        return 0
+    buys = _collection_to_df("buys", BUY_COLUMNS)
+    epoch = date(1970, 1, 1)
+    count = 0
+
+    for _, s in sells.iterrows():
+        existing = s.get("holdingDays")
+        if existing is not None and not (isinstance(existing, float) and math.isnan(existing)):
+            continue  # already stamped
+
+        etf_name = str(s["etfName"])
+        try:
+            sell_dt = pd.to_datetime(s["sellDate"]).date()
+            sell_ep = (sell_dt - epoch).days
+        except Exception:
+            continue
+
+        valid_lots = []
+        if not buys.empty:
+            for _, b in buys[buys["etfName"] == etf_name].iterrows():
+                try:
+                    if pd.to_datetime(b["buyDate"]).date() <= sell_dt:
+                        valid_lots.append(b)
+                except Exception:
+                    pass
+
+        if valid_lots:
+            inv_total = inv_date_sum = 0.0
+            for b in valid_lots:
+                inv = float(b["price"]) * float(b["quantity"])
+                ep  = (pd.to_datetime(b["buyDate"]).date() - epoch).days
+                inv_total    += inv
+                inv_date_sum += inv * ep
+            holding_days = round((sell_ep - inv_date_sum / inv_total) if inv_total > 0 else 0.0, 1)
+        else:
+            try:
+                buy_dt = pd.to_datetime(s["lastPurchaseDate"]).date()
+                holding_days = round(max(0.0, float((sell_dt - buy_dt).days)), 1)
+            except Exception:
+                holding_days = 0.0
+
+        db.collection("sells").document(str(s["id"])).update({"holdingDays": holding_days})
+        count += 1
+
+    clear_data_cache()
+    return count
 
 
 # ── ETFs (local CSV cache) ────────────────────────────────────────────────────
@@ -677,7 +892,6 @@ def buy_etf(
 
     save_holdings(holdings)
 
-    buys = load_buys()
     buy_row = {
         "id": str(uuid.uuid4()),
         "holdingId": holding_id,
@@ -690,8 +904,17 @@ def buy_etf(
         "totalCharges": charges["total"],
         "buyDate": _now_iso(),
     }
-    buys = pd.concat([buys, pd.DataFrame([buy_row])], ignore_index=True)
-    save_buys(buys)
+    _add_document("buys", buy_row)
+
+    epoch_days = (date.today() - date(1970, 1, 1)).days
+    _update_stats({
+        "buyCount": 1,
+        "buyGross": value,
+        "buyBrokerage": charges["brokerage"],
+        "buyTotalCharges": charges["total"],
+        "openInvTotal": value,
+        "openInvDateSum": value * epoch_days,
+    })
 
     user.remainingAmount = user.remainingAmount - value - charges["total"]
     save_user(user)
@@ -706,7 +929,6 @@ def sell_holding(
     dividend: float,
 ) -> tuple[UserSettings, pd.DataFrame, pd.DataFrame, dict]:
     holdings = load_holdings()
-    sells = load_sells()
 
     row = holdings[holdings["id"] == holding_id]
     if row.empty:
@@ -729,6 +951,28 @@ def sell_holding(
 
     remaining_qty = old_qty - quantity
 
+    # Compute exact weighted-avg holding days from buy lots for this holding
+    epoch = date(1970, 1, 1)
+    sell_epoch = (date.today() - epoch).days
+    if "buys" in _DATA_CACHE and not _DATA_CACHE["buys"].empty:
+        holding_lots = _DATA_CACHE["buys"][_DATA_CACHE["buys"]["holdingId"] == holding_id]
+    else:
+        raw = list(db.collection("buys").where("holdingId", "==", holding_id).stream())
+        holding_lots = pd.DataFrame([d.to_dict() for d in raw]) if raw else pd.DataFrame()
+    if holding_lots.empty:
+        holding_days = 0.0
+    else:
+        inv_total = inv_date_sum = 0.0
+        for _, b in holding_lots.iterrows():
+            inv = float(b["price"]) * float(b["quantity"])
+            try:
+                ep = (pd.to_datetime(b["buyDate"]).date() - epoch).days
+            except Exception:
+                ep = sell_epoch
+            inv_total += inv
+            inv_date_sum += inv * ep
+        holding_days = round((sell_epoch - inv_date_sum / inv_total) if inv_total > 0 else 0.0, 1)
+
     sell_row = {
         "id": str(uuid.uuid4()),
         "etfName": etf_name,
@@ -741,9 +985,26 @@ def sell_holding(
         "dividendPaidToSelf": dividend,
         "lastPurchaseDate": last_purchase_date,
         "sellDate": _now_iso(),
+        "holdingDays": holding_days,
     }
-    sells = pd.concat([sells, pd.DataFrame([sell_row])], ignore_index=True)
-    save_sells(sells)
+    _add_document("sells", sell_row)
+
+    sold_inv = old_avg * quantity
+    epoch = date(1970, 1, 1)
+    try:
+        sold_ep_days = (pd.to_datetime(last_purchase_date).date() - epoch).days
+    except Exception:
+        sold_ep_days = (date.today() - epoch).days
+    _update_stats({
+        "sellCount": 1,
+        "sellGross": value,
+        "sellBrokerage": brokerage,
+        "sellNetPL": (sell_price - old_avg) * quantity - brokerage - tax - dividend,
+        "sellTotalCharges": brokerage + tax,
+        "sellDividend": dividend,
+        "openInvTotal": -sold_inv,
+        "openInvDateSum": -sold_inv * sold_ep_days,
+    })
 
     if remaining_qty == 0:
         holdings = holdings.drop(idx).reset_index(drop=True)
@@ -765,7 +1026,7 @@ def sell_holding(
     )
     save_user(user)
 
-    return user, holdings, sells, charges
+    return user, holdings, pd.DataFrame([sell_row]), charges
 
 
 def update_buy_price(user: UserSettings, buy_id: str, new_exec_value: float) -> UserSettings:
@@ -915,8 +1176,9 @@ def classify_holdings(
 
 def reset_all_transactions(user: UserSettings) -> UserSettings:
     save_holdings(pd.DataFrame(columns=HOLDING_COLUMNS))
-    save_sells(pd.DataFrame(columns=SELL_COLUMNS))
-    save_buys(pd.DataFrame(columns=BUY_COLUMNS))
+    _clear_collection("sells")
+    _clear_collection("buys")
+    db.collection("meta").document("stats").set(dict(STATS_DEFAULTS))
     user.remainingAmount = user.investment
     save_user(user)
     return user
@@ -938,10 +1200,8 @@ def delete_holding(user: UserSettings, holding_id: str) -> tuple[UserSettings, p
     holdings = holdings.drop(match.index).reset_index(drop=True)
     save_holdings(holdings)
 
-    buys = load_buys()
-    if not buys.empty:
-        buys = buys[buys["holdingId"] != holding_id].reset_index(drop=True)
-        save_buys(buys)
+    _delete_where("buys", "holdingId", holding_id)
+    rebuild_stats()  # rare operation — full rescan is acceptable
 
     user.remainingAmount = user.remainingAmount + value + est_charges["total"]
     save_user(user)
@@ -987,8 +1247,22 @@ def reverse_buy(user: UserSettings, buy_id: str) -> tuple[UserSettings, pd.DataF
         holdings.at[idx, "totalQuantity"] = new_qty
     save_holdings(holdings)
 
+    _delete_document("buys", buy_id)
     buys = buys.drop(match.index).reset_index(drop=True)
-    save_buys(buys)
+
+    epoch = date(1970, 1, 1)
+    try:
+        buy_ep_days = (pd.to_datetime(row["buyDate"]).date() - epoch).days
+    except Exception:
+        buy_ep_days = (date.today() - epoch).days
+    _update_stats({
+        "buyCount": -1,
+        "buyGross": -value,
+        "buyBrokerage": -float(row["brokerageCharges"]),
+        "buyTotalCharges": -total_charges,
+        "openInvTotal": -value,
+        "openInvDateSum": -value * buy_ep_days,
+    })
 
     user.remainingAmount = user.remainingAmount + value + total_charges
     save_user(user)
@@ -1038,8 +1312,27 @@ def reverse_sell(user: UserSettings, sell_id: str) -> tuple[UserSettings, pd.Dat
         holdings.at[idx, "totalQuantity"] = cur_qty + qty
     save_holdings(holdings)
 
+    _delete_document("sells", sell_id)
     sells = sells.drop(match.index).reset_index(drop=True)
-    save_sells(sells)
+
+    # Undo the sell's stats contribution; restore the open inv using lastPurchaseDate as proxy
+    restored_inv = original_avg * qty
+    epoch = date(1970, 1, 1)
+    try:
+        restore_ep_days = (pd.to_datetime(last_purchase_date).date() - epoch).days
+    except Exception:
+        restore_ep_days = (date.today() - epoch).days
+    net_pl = (sell_price - original_avg) * qty - brokerage - tax - dividend
+    _update_stats({
+        "sellCount": -1,
+        "sellGross": -value,
+        "sellBrokerage": -brokerage,
+        "sellNetPL": -net_pl,
+        "sellTotalCharges": -(brokerage + tax),
+        "sellDividend": -dividend,
+        "openInvTotal": restored_inv,
+        "openInvDateSum": restored_inv * restore_ep_days,
+    })
 
     user.remainingAmount = (
         user.remainingAmount - value + brokerage + dividend + tax
@@ -1190,6 +1483,80 @@ def compute_report(
         "holdingAmount": float(math.floor(cost_basis)),
         "currentValue": current_value,
         "portfolioPct": portfolio_pct,
+    }
+
+
+def compute_money_summary_from_stats(
+    user: "UserSettings",
+    holdings: pd.DataFrame,
+    etfs: pd.DataFrame,
+) -> dict:
+    """Fast version of compute_money_summary — reads meta/stats (1 doc) instead of
+    scanning all buys/sells/charges. Returns the same dict shape."""
+    s = load_stats()
+
+    buy_count        = int(s["buyCount"])
+    buy_gross        = float(s["buyGross"])
+    buy_brokerage    = float(s["buyBrokerage"])
+    buy_total_chg    = float(s["buyTotalCharges"])
+    buy_tax          = buy_total_chg - buy_brokerage
+    buy_outflow      = buy_gross + buy_total_chg
+
+    sell_count       = int(s["sellCount"])
+    sell_gross       = float(s["sellGross"])
+    sell_brokerage   = float(s["sellBrokerage"])
+    sell_net_pl      = float(s["sellNetPL"])
+    sell_total_chg   = float(s["sellTotalCharges"])
+    sell_tax         = sell_total_chg - sell_brokerage
+    sell_dividend    = float(s["sellDividend"])
+    sell_gross_pl    = sell_net_pl + sell_total_chg + sell_dividend
+    sell_inflow      = sell_gross - sell_total_chg - sell_dividend
+    charges_total    = float(s["chargesTotal"])
+
+    cost_basis = current_value = 0.0
+    if not holdings.empty:
+        cost_basis = float(
+            (holdings["averagePrice"].astype(float) * holdings["totalQuantity"].astype(int)).sum()
+        )
+        if not etfs.empty:
+            m = holdings.merge(etfs[["name", "cmp"]], left_on="etfName", right_on="name", how="left")
+            m["cmp"] = m["cmp"].fillna(0).astype(float)
+            current_value = float((m["cmp"] * m["totalQuantity"].astype(int)).sum())
+
+    initial_deposit  = float(user.totalDeposited) if user.totalDeposited > 0 else float(user.investment) - sell_net_pl
+    remaining_cash   = float(user.remainingAmount)
+    account_balance  = remaining_cash + cost_basis
+    expected_balance = initial_deposit + sell_net_pl - buy_total_chg - charges_total
+    fees_paid_total  = buy_total_chg + sell_total_chg
+
+    return {
+        "initialDeposit":    initial_deposit,
+        "currentInvestment": float(user.investment),
+        "remainingCash":     remaining_cash,
+        "costBasis":         cost_basis,
+        "currentValue":      current_value,
+        "unrealizedPL":      current_value - cost_basis,
+        "buyCount":          buy_count,
+        "buyGross":          buy_gross,
+        "buyBrokerage":      buy_brokerage,
+        "buyTax":            buy_tax,
+        "buyTotalCharges":   buy_total_chg,
+        "buyOutflow":        buy_outflow,
+        "sellCount":         sell_count,
+        "sellGross":         sell_gross,
+        "sellBrokerage":     sell_brokerage,
+        "sellTax":           sell_tax,
+        "sellDividend":      sell_dividend,
+        "sellFeesTotal":     sell_total_chg,
+        "sellInflow":        sell_inflow,
+        "sellGrossPL":       sell_gross_pl,
+        "sellNetPL":         sell_net_pl,
+        "feesPaidTotal":     fees_paid_total,
+        "moneyConsumed":     fees_paid_total + sell_dividend,
+        "chargesTotal":      charges_total,
+        "accountBalance":    account_balance,
+        "expectedBalance":   expected_balance,
+        "reconcileDiff":     account_balance - expected_balance,
     }
 
 
@@ -1411,6 +1778,86 @@ def fix_reconciliation_drift(
     user.remainingAmount = user.remainingAmount - diff
     save_user(user)
     return user, diff
+
+
+def compute_holding_time_stats(
+    holdings: pd.DataFrame,
+    sells: pd.DataFrame,
+    buys: pd.DataFrame | None = None,
+) -> dict:
+    """Weighted-average holding time across open and closed positions.
+
+    Formula: Σ(Investment Amount × Holding Days) ÷ Total Investment Amount
+    For open positions each individual buy lot is used (price × qty × days since that buy).
+    For closed positions sellDate − lastPurchaseDate is used per sell record.
+    """
+    today = date.today()
+
+    def _wavg(rows: list[dict]) -> float:
+        total = sum(r["costBasis"] for r in rows)
+        if total <= 0:
+            return 0.0
+        return sum(r["holdingDays"] * r["costBasis"] for r in rows) / total
+
+    # ── Open positions — per buy-lot ──────────────────────────────────────
+    open_rows: list[dict] = []
+    if not holdings.empty:
+        held_etfs = set(holdings["etfName"].astype(str).tolist())
+
+        if buys is not None and not buys.empty:
+            # Per-lot: every buy for ETFs still in holdings
+            for _, b in buys[buys["etfName"].isin(held_etfs)].iterrows():
+                try:
+                    buy_dt = pd.to_datetime(b["buyDate"]).date()
+                    days   = max(0, (today - buy_dt).days)
+                except Exception:
+                    days = 0
+                lot_inv = float(b["price"]) * float(b["quantity"])
+                open_rows.append({"etfName": str(b["etfName"]), "holdingDays": days, "costBasis": lot_inv})
+        else:
+            # Fallback when buys not provided: use lastPurchaseDate + total cost basis
+            for _, row in holdings.iterrows():
+                try:
+                    buy_dt = pd.to_datetime(row["lastPurchaseDate"]).date()
+                    days   = max(0, (today - buy_dt).days)
+                except Exception:
+                    days = 0
+                cost_basis = float(row["averagePrice"]) * int(row["totalQuantity"])
+                open_rows.append({"etfName": str(row["etfName"]), "holdingDays": days, "costBasis": cost_basis})
+
+    # Per-ETF rollup for the table display
+    etf_wavg: dict[str, dict] = {}
+    for r in open_rows:
+        e = r["etfName"]
+        if e not in etf_wavg:
+            etf_wavg[e] = {"etfName": e, "_num": 0.0, "_den": 0.0}
+        etf_wavg[e]["_num"] += r["holdingDays"] * r["costBasis"]
+        etf_wavg[e]["_den"] += r["costBasis"]
+    open_summary: list[dict] = []
+    for e, v in etf_wavg.items():
+        wavg_d = v["_num"] / v["_den"] if v["_den"] > 0 else 0.0
+        open_summary.append({"etfName": e, "holdingDays": round(wavg_d, 1), "costBasis": v["_den"]})
+
+    # ── Closed positions — per sell record ────────────────────────────────
+    closed_rows: list[dict] = []
+    if not sells.empty:
+        for _, row in sells.iterrows():
+            try:
+                sell_dt = pd.to_datetime(row["sellDate"]).date()
+                buy_dt  = pd.to_datetime(row["lastPurchaseDate"]).date()
+                days    = max(0, (sell_dt - buy_dt).days)
+            except Exception:
+                days = 0
+            cost_basis = float(row["averagePurchasePrice"]) * float(row["quantity"])
+            closed_rows.append({"etfName": str(row["etfName"]), "holdingDays": days, "costBasis": cost_basis})
+
+    return {
+        "openPositions":         open_summary,
+        "closedPositions":       closed_rows,
+        "weightedAvgDaysOpen":   _wavg(open_rows),
+        "weightedAvgDaysClosed": _wavg(closed_rows),
+        "weightedAvgDaysAll":    _wavg(open_rows + closed_rows),
+    }
 
 
 def money_by_month(buys: pd.DataFrame, sells: pd.DataFrame) -> pd.DataFrame:
