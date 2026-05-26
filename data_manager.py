@@ -470,7 +470,7 @@ def save_charge(charge_type: str, amount: float, description: str, charge_date: 
     }
     db.collection("charges").document(row["id"]).set(row)
     _update_stats({"chargesTotal": amount})
-    clear_data_cache()
+    _DATA_CACHE.pop("charges", None)
 
 
 def load_cashflow() -> pd.DataFrame:
@@ -495,10 +495,11 @@ def fetch_cashflow_page(page_size: int, cursor=None) -> tuple[pd.DataFrame, obje
 
 
 def fetch_cashflow_in_range(date_from: str, date_to: str, page_size: int = 20, cursor=None) -> tuple[pd.DataFrame, object]:
+    date_to_end = date_to if "T" in date_to else date_to + "T23:59:59"
     q = (
         db.collection("cashflow")
         .where("date", ">=", date_from)
-        .where("date", "<=", date_to)
+        .where("date", "<=", date_to_end)
         .order_by("date", direction=firestore.Query.DESCENDING)
     )
     if cursor is not None:
@@ -523,7 +524,7 @@ def save_cashflow(txn_type: str, amount: float, txn_date: str | None = None, not
         "note": note,
     }
     db.collection("cashflow").document(row["id"]).set(row)
-    clear_data_cache()
+    _DATA_CACHE.pop("cashflow", None)
 
 
 def check_and_apply_amc(user: UserSettings) -> tuple[UserSettings, float]:
@@ -631,10 +632,13 @@ def count_collection(col_name: str) -> int:
 
 def fetch_buys_in_range(date_from: str, date_to: str, page_size: int = 20, cursor=None) -> tuple[pd.DataFrame, object]:
     """Fetch one page of buys in a date range, newest first. Returns (df, last_doc)."""
+    # Append end-of-day time so ISO-timestamped records (e.g. "2026-05-25T14:32:00")
+    # are not excluded by the <= upper bound when date_to is a plain "YYYY-MM-DD" string.
+    date_to_end = date_to if "T" in date_to else date_to + "T23:59:59"
     q = (
         db.collection("buys")
         .where("buyDate", ">=", date_from)
-        .where("buyDate", "<=", date_to)
+        .where("buyDate", "<=", date_to_end)
         .order_by("buyDate", direction=firestore.Query.DESCENDING)
     )
     if cursor is not None:
@@ -652,10 +656,11 @@ def fetch_buys_in_range(date_from: str, date_to: str, page_size: int = 20, curso
 
 def fetch_sells_in_range(date_from: str, date_to: str, page_size: int = 20, cursor=None) -> tuple[pd.DataFrame, object]:
     """Fetch one page of sells in a date range, newest first. Returns (df, last_doc)."""
+    date_to_end = date_to if "T" in date_to else date_to + "T23:59:59"
     q = (
         db.collection("sells")
         .where("sellDate", ">=", date_from)
-        .where("sellDate", "<=", date_to)
+        .where("sellDate", "<=", date_to_end)
         .order_by("sellDate", direction=firestore.Query.DESCENDING)
     )
     if cursor is not None:
@@ -672,10 +677,11 @@ def fetch_sells_in_range(date_from: str, date_to: str, page_size: int = 20, curs
 
 
 def count_in_range(col_name: str, date_field: str, date_from: str, date_to: str) -> int:
+    date_to_end = date_to if "T" in date_to else date_to + "T23:59:59"
     result = (
         db.collection(col_name)
         .where(date_field, ">=", date_from)
-        .where(date_field, "<=", date_to)
+        .where(date_field, "<=", date_to_end)
         .count()
         .get()
     )
@@ -715,6 +721,9 @@ def backfill_buys_from_holdings() -> int:
         })
     for row in new_rows:
         _add_document("buys", row)
+    if new_rows:
+        # Resync meta/stats — backfill adds buy docs that weren't counted before.
+        rebuild_stats()
     return len(new_rows)
 
 
@@ -990,11 +999,9 @@ def sell_holding(
     _add_document("sells", sell_row)
 
     sold_inv = old_avg * quantity
-    epoch = date(1970, 1, 1)
-    try:
-        sold_ep_days = (pd.to_datetime(last_purchase_date).date() - epoch).days
-    except Exception:
-        sold_ep_days = (date.today() - epoch).days
+    # Use the weighted buy epoch already derived from buy lots above.
+    # holding_days = sell_epoch − weighted_buy_epoch  →  weighted_buy_epoch = sell_epoch − holding_days
+    sold_ep_days = sell_epoch - holding_days
     _update_stats({
         "sellCount": 1,
         "sellGross": value,
@@ -1076,6 +1083,10 @@ def update_buy_price(user: UserSettings, buy_id: str, new_exec_value: float) -> 
     diff = new_total_cost - old_total_cost
     user.remainingAmount -= diff
     save_user(user)
+
+    # Resync meta/stats and bust cache (price edit changes buyGross, charges, openInv)
+    _DATA_CACHE.pop("buys", None)
+    rebuild_stats()
     return user
 
 
@@ -1096,6 +1107,9 @@ def update_sell_price(sell_id: str, kotak_total: float) -> dict:
         "brokerageCharges": charges["brokerage"],
         "tax":              charges["tax"],
     })
+    # Resync meta/stats and bust cache (price edit changes sellGross, charges, sellNetPL)
+    _DATA_CACHE.pop("sells", None)
+    rebuild_stats()
     return {"newPrice": new_price, "charges": charges}
 
 
@@ -1178,6 +1192,8 @@ def reset_all_transactions(user: UserSettings) -> UserSettings:
     save_holdings(pd.DataFrame(columns=HOLDING_COLUMNS))
     _clear_collection("sells")
     _clear_collection("buys")
+    _clear_collection("charges")
+    _clear_collection("cashflow")
     db.collection("meta").document("stats").set(dict(STATS_DEFAULTS))
     user.remainingAmount = user.investment
     save_user(user)
@@ -1315,11 +1331,14 @@ def reverse_sell(user: UserSettings, sell_id: str) -> tuple[UserSettings, pd.Dat
     _delete_document("sells", sell_id)
     sells = sells.drop(match.index).reset_index(drop=True)
 
-    # Undo the sell's stats contribution; restore the open inv using lastPurchaseDate as proxy
+    # Undo the sell's stats contribution; restore open inv using the stamped holdingDays
+    # to recover the exact weighted buy epoch used at sell time.
     restored_inv = original_avg * qty
     epoch = date(1970, 1, 1)
     try:
-        restore_ep_days = (pd.to_datetime(last_purchase_date).date() - epoch).days
+        sell_ep_days = (pd.to_datetime(row["sellDate"]).date() - epoch).days
+        hd = float(row.get("holdingDays", 0) or 0)
+        restore_ep_days = sell_ep_days - hd  # mirrors: holding_days = sell_epoch - weighted_buy_epoch
     except Exception:
         restore_ep_days = (date.today() - epoch).days
     net_pl = (sell_price - original_avg) * qty - brokerage - tax - dividend
@@ -1551,6 +1570,7 @@ def compute_money_summary_from_stats(
         "sellInflow":        sell_inflow,
         "sellGrossPL":       sell_gross_pl,
         "sellNetPL":         sell_net_pl,
+        "sellCostAtSale":    sell_gross - sell_gross_pl,  # Σ(avgPrice × qty) at time of sell
         "feesPaidTotal":     fees_paid_total,
         "moneyConsumed":     fees_paid_total + sell_dividend,
         "chargesTotal":      charges_total,
@@ -1843,9 +1863,15 @@ def compute_holding_time_stats(
     if not sells.empty:
         for _, row in sells.iterrows():
             try:
-                sell_dt = pd.to_datetime(row["sellDate"]).date()
-                buy_dt  = pd.to_datetime(row["lastPurchaseDate"]).date()
-                days    = max(0, (sell_dt - buy_dt).days)
+                stamped = float(row.get("holdingDays") or 0)
+                if stamped > 0:
+                    # Use the precise weighted-avg buy-lot value stamped at sell time
+                    days = stamped
+                else:
+                    # Legacy record: fall back to simple sellDate − lastPurchaseDate
+                    sell_dt = pd.to_datetime(row["sellDate"]).date()
+                    buy_dt  = pd.to_datetime(row["lastPurchaseDate"]).date()
+                    days    = max(0, (sell_dt - buy_dt).days)
             except Exception:
                 days = 0
             cost_basis = float(row["averagePurchasePrice"]) * float(row["quantity"])

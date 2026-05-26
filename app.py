@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import hmac
 import time
@@ -1997,8 +1998,13 @@ def page_reports() -> None:
 
     holdings = dm.load_holdings()
     m = dm.compute_money_summary_from_stats(user, holdings, etfs)
-    ht = dm.compute_holding_time_stats(holdings, dm.load_sells(), dm.load_buys())
-    avg_hold_days = int(ht["weightedAvgDaysOpen"])
+
+    # Derive avg hold days from meta/stats (no collection load needed)
+    _s = dm.load_stats()
+    _open_inv   = float(_s.get("openInvTotal", 0) or 0)
+    _open_dsum  = float(_s.get("openInvDateSum", 0) or 0)
+    _today_ep   = (date.today() - date(1970, 1, 1)).days
+    avg_hold_days = int(_today_ep - _open_dsum / _open_inv) if _open_inv > 0 else 0
 
     # ── Chapter 1 — The headline ──────────────────────────────────────────
     deployed      = m["costBasis"] + m["buyTotalCharges"]
@@ -2179,7 +2185,7 @@ def page_reports() -> None:
             if not st.session_state.get(_guard):
                 st.session_state[_guard] = True
                 adj = m["reconcileDiff"]
-                updated_user = st.session_state.user
+                updated_user = copy.copy(st.session_state.user)
                 updated_user.remainingAmount -= adj
                 dm.save_user(updated_user)
                 st.session_state.user = updated_user
@@ -2343,6 +2349,7 @@ def page_settings() -> None:
                         amcAmount=user.amcAmount,
                         lastAmcDate=user.lastAmcDate,
                         totalDeposited=user.totalDeposited + amount,
+                        defaultPageSize=user.defaultPageSize,
                     )
                     dm.save_user(u)
                     dm.save_cashflow("deposit", amount)
@@ -2384,6 +2391,7 @@ def page_settings() -> None:
                         amcAmount=user.amcAmount,
                         lastAmcDate=user.lastAmcDate,
                         totalDeposited=user.totalDeposited - amount,
+                        defaultPageSize=user.defaultPageSize,
                     )
                     dm.save_user(u)
                     dm.save_cashflow("withdrawal", amount)
@@ -2436,6 +2444,7 @@ def page_settings() -> None:
                         buyInDipThreshold=user.buyInDipThreshold,
                         amcAmount=user.amcAmount,
                         lastAmcDate=user.lastAmcDate,
+                        defaultPageSize=user.defaultPageSize,
                     )
                     dm.save_user(u)
                     dm.save_charge("AMC", amount, desc, charge_date.isoformat())
@@ -3073,11 +3082,13 @@ def _render_transaction_list(df: pd.DataFrame, kind: str, filtered: bool = False
         _batch     = st.session_state.get("txn_batch", _TXN_BATCH)
         next_batch = min(_batch, remaining)
         if st.button(f"⬇ Load {next_batch} more  ({loaded} of {total})", key=f"load_more_{kind}", use_container_width=True):
-            cursor   = st.session_state.get(f"txn_cursor_{kind}")
-            from_str = st.session_state.get("txn_filter_from")
-            to_str   = st.session_state.get("txn_filter_to")
-            f_str    = from_str.isoformat() if from_str else None
-            t_str    = to_str.isoformat()   if to_str   else None
+            cursor     = st.session_state.get(f"txn_cursor_{kind}")
+            filter_key = st.session_state.get("txn_filter_key")
+            if filter_key:
+                parts = filter_key.split("_", 1)
+                f_str, t_str = (parts[0], parts[1]) if len(parts) == 2 else (None, None)
+            else:
+                f_str = t_str = None
             if f_str or t_str:
                 f_str = f_str or "1900-01-01"
                 t_str = t_str or "2999-12-31"
