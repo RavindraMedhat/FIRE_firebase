@@ -2445,6 +2445,7 @@ def page_settings() -> None:
                         buyInDipThreshold=user.buyInDipThreshold,
                         amcAmount=user.amcAmount,
                         lastAmcDate=user.lastAmcDate,
+                        totalDeposited=user.totalDeposited,
                         defaultPageSize=user.defaultPageSize,
                     )
                     dm.save_user(u)

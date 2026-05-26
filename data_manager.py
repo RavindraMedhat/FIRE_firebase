@@ -325,16 +325,43 @@ def rebuild_stats() -> dict:
         stats["buyBrokerage"] = float(buys["brokerageCharges"].astype(float).sum())
         stats["buyTotalCharges"] = float(buys["totalCharges"].astype(float).sum())
 
-        active_ids = set(holdings["id"].astype(str).tolist()) if not holdings.empty else set()
-        open_buys = buys[buys["holdingId"].isin(active_ids)] if active_ids else pd.DataFrame()
-        for _, b in (open_buys.iterrows() if not open_buys.empty else []):
-            inv = float(b["price"]) * float(b["quantity"])
-            try:
-                ep_days = (pd.to_datetime(b["buyDate"]).date() - epoch).days
-            except Exception:
-                ep_days = (today - epoch).days
-            stats["openInvTotal"] += inv
-            stats["openInvDateSum"] += inv * ep_days
+        # openInvTotal / openInvDateSum must use holdings (remaining qty × avg price),
+        # NOT raw buy lots. Buy lots are never shrunk on partial sells, so summing them
+        # overstates openInvTotal by the already-sold units.
+        if not holdings.empty:
+            active_ids = set(holdings["id"].astype(str).tolist())
+            # Index buy lots by holdingId for efficient per-holding weighted-epoch lookup
+            lot_by_holding: dict[str, list] = {}
+            if not buys.empty:
+                for _, b in buys[buys["holdingId"].isin(active_ids)].iterrows():
+                    hid = str(b["holdingId"])
+                    lot_by_holding.setdefault(hid, []).append(b)
+
+            for _, h in holdings.iterrows():
+                hid = str(h["id"])
+                remaining_inv = float(h["averagePrice"]) * float(h["totalQuantity"])
+                stats["openInvTotal"] += remaining_inv
+
+                lots = lot_by_holding.get(hid, [])
+                if lots:
+                    # Weighted buy epoch from actual lots (same formula as sell_holding)
+                    lot_inv_total = lot_date_sum = 0.0
+                    for b in lots:
+                        lot_inv = float(b["price"]) * float(b["quantity"])
+                        try:
+                            ep = (pd.to_datetime(b["buyDate"]).date() - epoch).days
+                        except Exception:
+                            ep = (today - epoch).days
+                        lot_inv_total += lot_inv
+                        lot_date_sum  += lot_inv * ep
+                    weighted_ep = lot_date_sum / lot_inv_total if lot_inv_total > 0 else (today - epoch).days
+                else:
+                    try:
+                        weighted_ep = (pd.to_datetime(h["lastPurchaseDate"]).date() - epoch).days
+                    except Exception:
+                        weighted_ep = (today - epoch).days
+
+                stats["openInvDateSum"] += remaining_inv * weighted_ep
 
     if not sells.empty:
         q  = sells["quantity"].astype(float)
