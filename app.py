@@ -1191,6 +1191,7 @@ def _buy_dialog(name: str, etf_type: str, price: float, qty: int) -> None:
                 updated_user, etfs, dm.load_holdings()
             )
             st.toast(f"🛒 Bought {qty} × {name} — total {fmt_money(total_cost)}", icon="✅")
+            del st.session_state[_guard]
             st.rerun()
         except Exception as exc:
             del st.session_state[_guard]
@@ -1243,6 +1244,7 @@ def _sell_dialog(holding_id: str, name: str, etf_type: str, sell_price: float, q
                 updated_user, etfs, dm.load_holdings()
             )
             st.toast(f"💰 Sold {qty} × {name} — net {fmt_money(net)}", icon="✅")
+            del st.session_state[_guard]
             st.rerun()
         except Exception as exc:
             del st.session_state[_guard]
@@ -1277,6 +1279,7 @@ def _delete_dialog(holding_id: str, name: str, etf_type: str, avg_price: float, 
                 updated_user, etfs, dm.load_holdings()
             )
             st.toast(f"🗑️ Deleted {name} — refunded {fmt_money(refund)}", icon="✅")
+            del st.session_state[_guard]
             st.rerun()
         except Exception as exc:
             del st.session_state[_guard]
