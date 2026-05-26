@@ -652,6 +652,7 @@ with st.sidebar:
 
     if st.button("🔄 Refresh ETFs", use_container_width=True):
         refresh_etfs()
+        st.rerun()
 
     st.markdown(
         f'<div style="margin-top:8px;color:#8B93A7;font-size:0.78rem;">'
@@ -770,8 +771,14 @@ def page_home() -> None:
     pnl = current_value - cost_basis
     pnl_pct = (pnl / cost_basis * 100) if cost_basis else 0.0
 
-    ht = dm.compute_holding_time_stats(holdings, dm.load_sells(), dm.load_buys())
-    wavg_open_days = int(ht["weightedAvgDaysOpen"])
+    # Overall avg hold days from meta/stats — no collection scan needed
+    _s = dm.load_stats()
+    _open_inv  = float(_s.get("openInvTotal", 0) or 0)
+    _open_dsum = float(_s.get("openInvDateSum", 0) or 0)
+    _today_ep  = (date.today() - date(1970, 1, 1)).days
+    wavg_open_days = int(_today_ep - _open_dsum / _open_inv) if _open_inv > 0 else 0
+    # Per-ETF hold times need buy lots but NOT sell history — pass empty sells DF
+    ht = dm.compute_holding_time_stats(holdings, pd.DataFrame(), dm.load_buys())
     hold_time_by_etf = {op["etfName"]: op["holdingDays"] for op in ht["openPositions"]}
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -1154,6 +1161,14 @@ def _sell_form(row: pd.Series) -> None:
         )
 
 
+def _clear_txn_cache() -> None:
+    """Evict paginated Transactions and Sell History session caches after any write."""
+    for k in list(st.session_state.keys()):
+        if (k.startswith("txn_df_") or k.startswith("txn_cursor_")
+                or k.startswith("sh_df") or k.startswith("sh_cursor")):
+            del st.session_state[k]
+
+
 @st.dialog("Confirm Buy")
 def _buy_dialog(name: str, etf_type: str, price: float, qty: int) -> None:
     value = price * qty
@@ -1192,6 +1207,7 @@ def _buy_dialog(name: str, etf_type: str, price: float, qty: int) -> None:
             )
             st.toast(f"🛒 Bought {qty} × {name} — total {fmt_money(total_cost)}", icon="✅")
             del st.session_state[_guard]
+            _clear_txn_cache()
             st.rerun()
         except Exception as exc:
             del st.session_state[_guard]
@@ -1245,6 +1261,7 @@ def _sell_dialog(holding_id: str, name: str, etf_type: str, sell_price: float, q
             )
             st.toast(f"💰 Sold {qty} × {name} — net {fmt_money(net)}", icon="✅")
             del st.session_state[_guard]
+            _clear_txn_cache()
             st.rerun()
         except Exception as exc:
             del st.session_state[_guard]
@@ -1280,6 +1297,7 @@ def _delete_dialog(holding_id: str, name: str, etf_type: str, avg_price: float, 
             )
             st.toast(f"🗑️ Deleted {name} — refunded {fmt_money(refund)}", icon="✅")
             del st.session_state[_guard]
+            _clear_txn_cache()
             st.rerun()
         except Exception as exc:
             del st.session_state[_guard]
@@ -1350,19 +1368,25 @@ def _reverse_dialog(txn_id: str, kind: str, name: str, etf_type: str, summary: d
 
     c1, c2 = st.columns(2)
     if c1.button(f"↩️ Yes, reverse this {kind}", type="primary", use_container_width=True, key="dlg_rev_yes"):
-        try:
-            if kind == "buy":
-                updated_user, _, _ = dm.reverse_buy(st.session_state.user, txn_id)
-            else:
-                updated_user, _, _ = dm.reverse_sell(st.session_state.user, txn_id)
-            st.session_state.user = updated_user
-            st.session_state.suggestions = dm.generate_suggestions(
-                updated_user, etfs, dm.load_holdings()
-            )
-            st.toast(f"↩️ Reversed {kind} of {name}", icon="✅")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Could not reverse: {exc}")
+        _guard = f"_op_done_rev_{txn_id}"
+        if not st.session_state.get(_guard):
+            st.session_state[_guard] = True
+            try:
+                if kind == "buy":
+                    updated_user, _, _ = dm.reverse_buy(st.session_state.user, txn_id)
+                else:
+                    updated_user, _, _ = dm.reverse_sell(st.session_state.user, txn_id)
+                st.session_state.user = updated_user
+                st.session_state.suggestions = dm.generate_suggestions(
+                    updated_user, etfs, dm.load_holdings()
+                )
+                st.toast(f"↩️ Reversed {kind} of {name}", icon="✅")
+                del st.session_state[_guard]
+                _clear_txn_cache()
+                st.rerun()
+            except Exception as exc:
+                del st.session_state[_guard]
+                st.error(f"Could not reverse: {exc}")
     if c2.button("❌ Cancel", use_container_width=True, key="dlg_rev_no"):
         st.rerun()
 
@@ -1998,10 +2022,10 @@ def page_reports() -> None:
     st.markdown('<h2 style="margin-top:0">📊 Reports</h2>', unsafe_allow_html=True)
 
     holdings = dm.load_holdings()
-    m = dm.compute_money_summary_from_stats(user, holdings, etfs)
+    _s = dm.load_stats()  # load once — reused for summary and avg hold days
+    m = dm.compute_money_summary_from_stats(user, holdings, etfs, _stats=_s)
 
-    # Derive avg hold days from meta/stats (no collection load needed)
-    _s = dm.load_stats()
+    # Derive avg hold days from the same stats doc — no second Firestore read
     _open_inv   = float(_s.get("openInvTotal", 0) or 0)
     _open_dsum  = float(_s.get("openInvDateSum", 0) or 0)
     _today_ep   = (date.today() - date(1970, 1, 1)).days
@@ -2191,6 +2215,7 @@ def page_reports() -> None:
                 dm.save_user(updated_user)
                 st.session_state.user = updated_user
                 st.toast(f"✅ Remaining Amount adjusted by ₹{-adj:+.4f} — books balanced.", icon="🔧")
+                del st.session_state[_guard]
                 st.rerun()
 
     # ── Chapter 5 — Month by month ───────────────────────────────────────
@@ -2419,7 +2444,13 @@ def page_settings() -> None:
                 help="Use the actual date Kotak debited the charge.",
                 key="ch_date",
             )
-            description = st.text_input(
+            cr, cd = st.columns(2)
+            charge_type = cr.selectbox(
+                "Charge type",
+                ["AMC", "DP Charge", "Other"],
+                key="ch_type",
+            )
+            description = cd.text_input(
                 "Description (optional)",
                 placeholder="e.g. Demat AMC for April 2026",
                 key="ch_desc",
@@ -2449,7 +2480,7 @@ def page_settings() -> None:
                         defaultPageSize=user.defaultPageSize,
                     )
                     dm.save_user(u)
-                    dm.save_charge("AMC", amount, desc, charge_date.isoformat())
+                    dm.save_charge(charge_type, amount, desc, charge_date.isoformat())
                     st.session_state.user = u
                     st.session_state["_reset_ch"] = True
                     st.toast(f"✅ ₹{amount:.2f} on {charge_date.isoformat()} recorded.", icon="💸")
@@ -2605,6 +2636,7 @@ def _edit_sell_dialog(sell_id: str, name: str, qty: int, old_price: float) -> No
             try:
                 dm.update_sell_price(sell_id, new_total)
                 st.toast(f"✅ Updated to ₹{new_price:.4f}/unit", icon="✏️")
+                del st.session_state[_guard]
                 st.rerun()
             except Exception as e:
                 del st.session_state[_guard]
@@ -2639,6 +2671,7 @@ def _edit_buy_dialog(buy_id: str, name: str, qty: int, old_price: float) -> None
                 updated_user = dm.update_buy_price(st.session_state.user, buy_id, new_total)
                 st.session_state.user = updated_user
                 st.toast(f"✅ Updated to ₹{new_price:.4f}/unit", icon="✏️")
+                del st.session_state[_guard]
                 st.rerun()
             except Exception as e:
                 del st.session_state[_guard]

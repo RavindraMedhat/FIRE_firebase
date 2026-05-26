@@ -325,43 +325,41 @@ def rebuild_stats() -> dict:
         stats["buyBrokerage"] = float(buys["brokerageCharges"].astype(float).sum())
         stats["buyTotalCharges"] = float(buys["totalCharges"].astype(float).sum())
 
-        # openInvTotal / openInvDateSum must use holdings (remaining qty × avg price),
-        # NOT raw buy lots. Buy lots are never shrunk on partial sells, so summing them
-        # overstates openInvTotal by the already-sold units.
-        if not holdings.empty:
-            active_ids = set(holdings["id"].astype(str).tolist())
-            # Index buy lots by holdingId for efficient per-holding weighted-epoch lookup
-            lot_by_holding: dict[str, list] = {}
-            if not buys.empty:
-                for _, b in buys[buys["holdingId"].isin(active_ids)].iterrows():
-                    hid = str(b["holdingId"])
-                    lot_by_holding.setdefault(hid, []).append(b)
+    # openInvTotal / openInvDateSum: always computed from holdings regardless of whether
+    # buys exist (e.g. legacy data before backfill). Uses remaining qty × avg price so
+    # partial sells don't overcount.
+    if not holdings.empty:
+        active_ids = set(holdings["id"].astype(str).tolist())
+        lot_by_holding: dict[str, list] = {}
+        if not buys.empty:
+            for _, b in buys[buys["holdingId"].isin(active_ids)].iterrows():
+                hid = str(b["holdingId"])
+                lot_by_holding.setdefault(hid, []).append(b)
 
-            for _, h in holdings.iterrows():
-                hid = str(h["id"])
-                remaining_inv = float(h["averagePrice"]) * float(h["totalQuantity"])
-                stats["openInvTotal"] += remaining_inv
+        for _, h in holdings.iterrows():
+            hid = str(h["id"])
+            remaining_inv = float(h["averagePrice"]) * float(h["totalQuantity"])
+            stats["openInvTotal"] += remaining_inv
 
-                lots = lot_by_holding.get(hid, [])
-                if lots:
-                    # Weighted buy epoch from actual lots (same formula as sell_holding)
-                    lot_inv_total = lot_date_sum = 0.0
-                    for b in lots:
-                        lot_inv = float(b["price"]) * float(b["quantity"])
-                        try:
-                            ep = (pd.to_datetime(b["buyDate"]).date() - epoch).days
-                        except Exception:
-                            ep = (today - epoch).days
-                        lot_inv_total += lot_inv
-                        lot_date_sum  += lot_inv * ep
-                    weighted_ep = lot_date_sum / lot_inv_total if lot_inv_total > 0 else (today - epoch).days
-                else:
+            lots = lot_by_holding.get(hid, [])
+            if lots:
+                lot_inv_total = lot_date_sum = 0.0
+                for b in lots:
+                    lot_inv = float(b["price"]) * float(b["quantity"])
                     try:
-                        weighted_ep = (pd.to_datetime(h["lastPurchaseDate"]).date() - epoch).days
+                        ep = (pd.to_datetime(b["buyDate"]).date() - epoch).days
                     except Exception:
-                        weighted_ep = (today - epoch).days
+                        ep = (today - epoch).days
+                    lot_inv_total += lot_inv
+                    lot_date_sum  += lot_inv * ep
+                weighted_ep = lot_date_sum / lot_inv_total if lot_inv_total > 0 else (today - epoch).days
+            else:
+                try:
+                    weighted_ep = (pd.to_datetime(h["lastPurchaseDate"]).date() - epoch).days
+                except Exception:
+                    weighted_ep = (today - epoch).days
 
-                stats["openInvDateSum"] += remaining_inv * weighted_ep
+            stats["openInvDateSum"] += remaining_inv * weighted_ep
 
     if not sells.empty:
         q  = sells["quantity"].astype(float)
@@ -468,10 +466,11 @@ def fetch_charges_page(page_size: int, cursor=None) -> tuple[pd.DataFrame, objec
 
 
 def fetch_charges_in_range(date_from: str, date_to: str, page_size: int = 20, cursor=None) -> tuple[pd.DataFrame, object]:
+    date_to_end = date_to if "T" in date_to else date_to + "T23:59:59"
     q = (
         db.collection("charges")
         .where("chargeDate", ">=", date_from)
-        .where("chargeDate", "<=", date_to)
+        .where("chargeDate", "<=", date_to_end)
         .order_by("chargeDate", direction=firestore.Query.DESCENDING)
     )
     if cursor is not None:
@@ -1605,10 +1604,12 @@ def compute_money_summary_from_stats(
     user: "UserSettings",
     holdings: pd.DataFrame,
     etfs: pd.DataFrame,
+    _stats: dict | None = None,
 ) -> dict:
     """Fast version of compute_money_summary — reads meta/stats (1 doc) instead of
-    scanning all buys/sells/charges. Returns the same dict shape."""
-    s = load_stats()
+    scanning all buys/sells/charges. Returns the same dict shape.
+    Pass _stats to reuse an already-loaded stats dict and avoid a second Firestore read."""
+    s = _stats if _stats is not None else load_stats()
 
     buy_count        = int(s["buyCount"])
     buy_gross        = float(s["buyGross"])
@@ -1918,11 +1919,11 @@ def compute_holding_time_stats(
     # ── Open positions — per buy-lot ──────────────────────────────────────
     open_rows: list[dict] = []
     if not holdings.empty:
-        held_etfs = set(holdings["etfName"].astype(str).tolist())
+        active_ids = set(holdings["id"].astype(str).tolist())
 
         if buys is not None and not buys.empty:
-            # Per-lot: every buy for ETFs still in holdings
-            for _, b in buys[buys["etfName"].isin(held_etfs)].iterrows():
+            # Per-lot: buy lots whose holdingId is still active (excludes prior ownership cycles)
+            for _, b in buys[buys["holdingId"].isin(active_ids)].iterrows():
                 try:
                     buy_dt = pd.to_datetime(b["buyDate"]).date()
                     days   = max(0, (today - buy_dt).days)
