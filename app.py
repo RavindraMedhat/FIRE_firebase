@@ -1369,10 +1369,8 @@ def _reverse_dialog(txn_id: str, kind: str, name: str, etf_type: str, summary: d
 
 @st.dialog("📜 Transaction history", width="large")
 def _history_dialog(etf_name: str, etf_type: str) -> None:
-    buys = dm.load_buys()
-    sells = dm.load_sells()
-    bf = buys[buys["etfName"] == etf_name] if not buys.empty else buys
-    sf = sells[sells["etfName"] == etf_name] if not sells.empty else sells
+    bf = dm.fetch_buys_for_etf(etf_name)
+    sf = dm.fetch_sells_for_etf(etf_name)
 
     events: list[dict] = []
     if bf is not None and not bf.empty:

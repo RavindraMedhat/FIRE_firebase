@@ -528,20 +528,32 @@ def save_cashflow(txn_type: str, amount: float, txn_date: str | None = None, not
 
 
 def check_and_apply_amc(user: UserSettings) -> tuple[UserSettings, float]:
-    """Deduct monthly Demat AMC if 30+ days have passed since last deduction."""
+    """Deduct monthly Demat AMC if 30+ days have passed since last deduction.
+    Re-reads lastAmcDate fresh from Firestore so a second browser tab that opens
+    after the first already ran the deduction will see the updated date and skip."""
     if user.amcAmount <= 0:
         return user, 0.0
 
     today = date.today()
 
-    if not user.lastAmcDate:
-        # First run — record today as baseline without deducting
+    # Bypass cache: get the current lastAmcDate directly from Firestore.
+    fresh = (db.collection("meta").document("user").get().to_dict() or {})
+    last_str = str(fresh.get("lastAmcDate", "") or "")
+
+    if not last_str:
         user.lastAmcDate = today.isoformat()
         save_user(user)
         return user, 0.0
 
-    last = date.fromisoformat(user.lastAmcDate)
+    try:
+        last = date.fromisoformat(last_str)
+    except ValueError:
+        user.lastAmcDate = today.isoformat()
+        save_user(user)
+        return user, 0.0
+
     if (today - last) < timedelta(days=30):
+        user.lastAmcDate = last_str  # keep local object in sync with Firestore
         return user, 0.0
 
     amount = user.amcAmount
@@ -595,6 +607,18 @@ def save_sells(df: pd.DataFrame) -> None:
     _replace_collection("sells", df[SELL_COLUMNS], "id")
 
 
+def fetch_sells_for_etf(etf_name: str) -> pd.DataFrame:
+    """Return all sell records for a specific ETF without loading the full collection."""
+    docs = list(db.collection("sells").where("etfName", "==", etf_name).stream())
+    if not docs:
+        return pd.DataFrame(columns=SELL_COLUMNS)
+    df = pd.DataFrame([d.to_dict() for d in docs])
+    for col in SELL_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[SELL_COLUMNS]
+
+
 # ── Buys ─────────────────────────────────────────────────────────────────────
 
 def load_buys() -> pd.DataFrame:
@@ -623,6 +647,18 @@ def fetch_buys_page(page_size: int, cursor=None) -> tuple[pd.DataFrame, object]:
 
 def save_buys(df: pd.DataFrame) -> None:
     _replace_collection("buys", df[BUY_COLUMNS], "id")
+
+
+def fetch_buys_for_etf(etf_name: str) -> pd.DataFrame:
+    """Return all buy records for a specific ETF without loading the full collection."""
+    docs = list(db.collection("buys").where("etfName", "==", etf_name).stream())
+    if not docs:
+        return pd.DataFrame(columns=BUY_COLUMNS)
+    df = pd.DataFrame([d.to_dict() for d in docs])
+    for col in BUY_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+    return df[BUY_COLUMNS]
 
 
 def count_collection(col_name: str) -> int:
@@ -729,8 +765,8 @@ def backfill_buys_from_holdings() -> int:
 
 def backfill_sell_holding_days() -> int:
     """Compute and stamp holdingDays into every sell record that is missing it.
-    Uses all buy lots for that ETF where buyDate <= sellDate — same formula as
-    sell_holding() uses going forward."""
+    Uses only buy lots from the same ownership cycle (buys since the last time
+    qty reached zero), matching the formula sell_holding() uses going forward."""
     sells = _collection_to_df("sells", SELL_COLUMNS)
     if sells.empty:
         return 0
@@ -750,11 +786,44 @@ def backfill_sell_holding_days() -> int:
         except Exception:
             continue
 
+        # Find the start of the current ownership cycle: walk all prior
+        # transactions for this ETF chronologically and find the last date when
+        # cumulative qty reached zero. Buy lots before that date belong to a
+        # previous ownership cycle and must be excluded.
+        cycle_start_dt = epoch
+        txns: list[tuple[str, date, int]] = []
+        if not buys.empty:
+            for _, b in buys[buys["etfName"] == etf_name].iterrows():
+                try:
+                    bdt = pd.to_datetime(b["buyDate"]).date()
+                    if bdt < sell_dt:
+                        txns.append(("buy", bdt, int(b["quantity"])))
+                except Exception:
+                    pass
+        prior_sells = sells[sells["etfName"] == etf_name]
+        for _, ps in prior_sells.iterrows():
+            try:
+                sdt = pd.to_datetime(ps["sellDate"]).date()
+                if sdt < sell_dt:
+                    txns.append(("sell", sdt, int(ps["quantity"])))
+            except Exception:
+                pass
+        txns.sort(key=lambda t: t[1])
+        running_qty = 0
+        for kind, dt, qty in txns:
+            if kind == "buy":
+                running_qty += qty
+            else:
+                running_qty = max(0, running_qty - qty)
+                if running_qty == 0:
+                    cycle_start_dt = dt
+
         valid_lots = []
         if not buys.empty:
             for _, b in buys[buys["etfName"] == etf_name].iterrows():
                 try:
-                    if pd.to_datetime(b["buyDate"]).date() <= sell_dt:
+                    bdt = pd.to_datetime(b["buyDate"]).date()
+                    if cycle_start_dt < bdt <= sell_dt:
                         valid_lots.append(b)
                 except Exception:
                     pass
