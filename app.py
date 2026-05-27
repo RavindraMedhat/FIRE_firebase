@@ -944,23 +944,6 @@ def _render_holding_cards(
 
     df = df.copy()
 
-    # Weighted-avg holding time for this group — use per-lot dict when available
-    hold_stats = []
-    for _, row in df.iterrows():
-        etf_name = str(row["etfName"])
-        if hold_time_by_etf and etf_name in hold_time_by_etf:
-            days = int(hold_time_by_etf[etf_name])
-        else:
-            try:
-                buy_dt = pd.to_datetime(row["lastPurchaseDate"]).date()
-                days = max(0, (date.today() - buy_dt).days)
-            except Exception:
-                days = 0
-        cost_basis = float(row["averagePrice"]) * int(row["totalQuantity"])
-        hold_stats.append((days, cost_basis))
-    total_basis = sum(cb for _, cb in hold_stats)
-    wavg_days = int(sum(d * cb for d, cb in hold_stats) / total_basis) if total_basis > 0 else 0
-    st.caption(f"Weighted avg holding time: **{_fmt_hold_days(wavg_days)}** across {len(df)} position(s)")
     avg = df["averagePrice"].astype(float)
     cmp_f = df["cmp"].astype(float)
     has_cmp = cmp_f > 0
