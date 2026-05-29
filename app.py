@@ -1043,6 +1043,35 @@ def _render_holding_cards(
                 unsafe_allow_html=True,
             )
 
+            # Profit projection at sell target
+            _avg   = float(row["averagePrice"])
+            _qty   = int(row["totalQuantity"])
+            _tgt   = float(row["sellTarget"])
+            _cmp   = float(row["cmp"])
+            _etype = str(row["etfType"])
+            _sell_val  = _tgt * _qty
+            _sell_ch   = dm.compute_kotak_charges(_sell_val, _etype, side="sell")
+            _net_profit = (_tgt - _avg) * _qty - _sell_ch["total"]
+            _net_pct    = (_net_profit / (_avg * _qty) * 100) if _avg * _qty > 0 else 0.0
+            _p_col = "#2ecc71" if _net_profit >= 0 else "#e74c3c"
+            _cmp_note = ""
+            if _cmp > 0:
+                _to_target_pct = (_tgt - _cmp) / _cmp * 100
+                _cmp_note = (
+                    f' &nbsp;·&nbsp; CMP needs <span style="color:#3b9ddd">'
+                    f'{_to_target_pct:+.2f}%</span> to reach target'
+                    if abs(_to_target_pct) > 0.01 else
+                    f' &nbsp;·&nbsp; <span style="color:#2ecc71">At target now</span>'
+                )
+            st.markdown(
+                f'<div style="font-size:0.78rem;opacity:0.75;margin:4px 0 6px 0">'
+                f'At sell target ₹{_tgt:,.2f} (+{user.sellProfitTarget:.1f}%) → '
+                f'<span style="color:{_p_col};font-weight:600">'
+                f'{fmt_money(_net_profit)} net ({_net_pct:+.2f}%)</span>'
+                f'{_cmp_note}</div>',
+                unsafe_allow_html=True,
+            )
+
             # Direct action buttons — Sell + Buy more + History. To undo a
             # mistake buy, go to 🔄 Transactions → Reverse.
             btn_cols = st.columns(3)
