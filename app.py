@@ -1669,7 +1669,7 @@ def _render_fresh_suggestions(suggestions: list[dict]) -> None:
 
     for i, s in enumerate(suggestions):
         with st.container(border=True):
-            top = st.columns([3, 1, 1, 1])
+            top = st.columns([3, 1, 1, 1, 1])
             top[0].markdown(
                 f'**{s["name"]}** &nbsp; {badge(s["type"], "equity")}',
                 unsafe_allow_html=True,
@@ -1687,6 +1687,13 @@ def _render_fresh_suggestions(suggestions: list[dict]) -> None:
             top[3].markdown(
                 f'<div class="text-muted" style="font-size:0.75rem">EST. COST</div>'
                 f'<div>{fmt_money(s["price"] * s["quantity"])}</div>',
+                unsafe_allow_html=True,
+            )
+            dip = s.get("dip", 0.0)
+            dip_color = "#2ecc71" if dip >= 0 else "#e74c3c"
+            top[4].markdown(
+                f'<div class="text-muted" style="font-size:0.75rem">DIP vs 20-DMA</div>'
+                f'<div style="color:{dip_color}">{dip:+.2f}%</div>',
                 unsafe_allow_html=True,
             )
 

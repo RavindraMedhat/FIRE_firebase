@@ -1244,6 +1244,7 @@ def generate_suggestions(
             "name": str(best["name"]),
             "price": cmp_val,
             "quantity": qty,
+            "dip": float(best["change20DmaVsCmp"]),
         })
     return suggestions
 
