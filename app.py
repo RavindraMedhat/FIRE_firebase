@@ -1710,6 +1710,34 @@ def _render_fresh_suggestions(suggestions: list[dict]) -> None:
                 total_cost = value + ch["total"]
                 st.caption(f"Remaining after: **{fmt_money(user.remainingAmount - total_cost)}**")
                 _render_charge_breakdown(value, ch, side="buy")
+
+                # ── Profit projection ────────────────────────────────────────
+                target_pct   = user.sellProfitTarget
+                sell_target  = price * (1 + target_pct / 100)
+                sell_value   = sell_target * qty
+                sell_ch      = dm.compute_kotak_charges(sell_value, s["type"], side="sell")
+                gross_profit = (sell_target - price) * qty
+                net_profit   = gross_profit - sell_ch["total"]
+                net_pct      = (net_profit / total_cost * 100) if total_cost else 0.0
+                p_col = "#2ecc71" if net_profit >= 0 else "#e74c3c"
+                st.markdown(
+                    f'<div style="background:var(--secondary-background-color);'
+                    f'border-radius:8px;padding:10px 14px;margin:8px 0">'
+                    f'<div style="font-size:0.72rem;opacity:0.5;text-transform:uppercase;'
+                    f'letter-spacing:.07em;margin-bottom:6px">'
+                    f'If sold at +{target_pct:.1f}% target (₹{sell_target:,.2f}/unit)</div>'
+                    f'<div style="display:flex;gap:24px">'
+                    f'<div><div style="font-size:0.72rem;opacity:0.5">Gross profit</div>'
+                    f'<div>{fmt_money(gross_profit)}</div></div>'
+                    f'<div><div style="font-size:0.72rem;opacity:0.5">Sell charges</div>'
+                    f'<div>−{fmt_money(sell_ch["total"])}</div></div>'
+                    f'<div><div style="font-size:0.72rem;opacity:0.5">Net profit</div>'
+                    f'<div style="color:{p_col};font-weight:600">{fmt_money(net_profit)} '
+                    f'({net_pct:+.2f}%)</div></div>'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+
                 if st.button(
                     "✅ Review & Buy", key=f"rev_sug_{i}", use_container_width=True, type="primary"
                 ):
