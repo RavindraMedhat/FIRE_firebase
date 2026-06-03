@@ -1696,7 +1696,7 @@ def _render_buyback_section() -> None:
 
 def _render_fresh_suggestions(suggestions: list[dict]) -> None:
 
-    for i, s in enumerate(suggestions):
+    for s in suggestions:
         with st.container(border=True):
             top = st.columns([3, 1, 1, 1, 1])
             top[0].markdown(
@@ -1729,10 +1729,10 @@ def _render_fresh_suggestions(suggestions: list[dict]) -> None:
             with st.expander(f"Buy {s['name']}", expanded=False):
                 cc1, cc2 = st.columns(2)
                 price = cc1.number_input(
-                    "Price", min_value=0.0, value=float(s["price"]), step=0.05, key=f"p_{i}"
+                    "Price", min_value=0.0, value=float(s["price"]), step=0.05, key=f"sug_p_{s['name']}"
                 )
                 qty = cc2.number_input(
-                    "Quantity", min_value=1, value=int(s["quantity"]), step=1, key=f"q_{i}"
+                    "Quantity", min_value=1, value=int(s["quantity"]), step=1, key=f"sug_q_{s['name']}"
                 )
                 value = price * qty
                 ch = dm.compute_kotak_charges(value, s["type"], side="buy")
@@ -1768,7 +1768,7 @@ def _render_fresh_suggestions(suggestions: list[dict]) -> None:
                 )
 
                 if st.button(
-                    "✅ Review & Buy", key=f"rev_sug_{i}", use_container_width=True, type="primary"
+                    "✅ Review & Buy", key=f"sug_buy_{s['name']}", use_container_width=True, type="primary"
                 ):
                     _buy_dialog(
                         name=s["name"],
