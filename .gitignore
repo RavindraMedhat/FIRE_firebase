@@ -3,6 +3,10 @@ data set/
 fire_mobile/
 fire full/
 .venv/
+
+# Kotak reports — local analysis only
+reports/
+
 # Python
 __pycache__/
 *.pyc

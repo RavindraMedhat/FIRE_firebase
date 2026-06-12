@@ -1588,6 +1588,20 @@ def _buy_more_form(row: pd.Series) -> None:
     ch = dm.compute_kotak_charges(value, str(row["etfType"]), side="buy")
     total_cost = value + ch["total"]
     st.caption(f"Remaining after: **{fmt_money(user.remainingAmount - total_cost)}**")
+
+    old_avg = float(row["averagePrice"])
+    old_qty = int(row["totalQuantity"])
+    if effective_price > 0 and old_avg > 0:
+        new_avg = (old_avg * old_qty + effective_price * qty) / (old_qty + qty)
+        avg_change_pct = (new_avg - old_avg) / old_avg * 100
+        cmp_vs_new_avg = (new_avg - effective_price) / new_avg * 100
+        if effective_price < old_avg:
+            st.caption(f"New avg ₹{new_avg:.2f} ({avg_change_pct:+.2f}%) — CMP is {cmp_vs_new_avg:.2f}% below new avg")
+        elif effective_price > old_avg:
+            st.caption(f"New avg ₹{new_avg:.2f} ({avg_change_pct:+.2f}%) — buying above avg ⚠️")
+        else:
+            st.caption(f"New avg ₹{new_avg:.2f} — same as current avg")
+
     _render_charge_breakdown(value, ch, side="buy")
 
     if st.button("✅ Review & Buy", key=f"bbtn_{row['id']}", use_container_width=True, type="primary"):
