@@ -1291,7 +1291,7 @@ def reset_all_transactions(user: UserSettings) -> UserSettings:
     _clear_collection("charges")
     _clear_collection("cashflow")
     db.collection("meta").document("stats").set(dict(STATS_DEFAULTS))
-    user.remainingAmount = user.investment
+    user.remainingAmount = user.totalDeposited
     save_user(user)
     return user
 
@@ -1303,11 +1303,17 @@ def delete_holding(user: UserSettings, holding_id: str) -> tuple[UserSettings, p
         raise ValueError(f"Holding {holding_id} not found")
     row = match.iloc[0]
 
-    etf_type = str(row["etfType"])
     avg_price = float(row["averagePrice"])
     qty = int(row["totalQuantity"])
     value = avg_price * qty
-    est_charges = compute_kotak_charges(value, etf_type, side="buy")
+
+    # Read actual charges from buy records before deleting them
+    holding_buys = load_buys()
+    holding_buys = holding_buys[holding_buys["holdingId"] == holding_id]
+    total_bought_qty = int(holding_buys["quantity"].astype(int).sum()) if not holding_buys.empty else qty
+    total_actual_charges = float(holding_buys["totalCharges"].astype(float).sum()) if not holding_buys.empty else 0.0
+    remaining_frac = qty / total_bought_qty if total_bought_qty > 0 else 1.0
+    actual_charges = total_actual_charges * remaining_frac
 
     holdings = holdings.drop(match.index).reset_index(drop=True)
     save_holdings(holdings)
@@ -1315,7 +1321,7 @@ def delete_holding(user: UserSettings, holding_id: str) -> tuple[UserSettings, p
     _delete_where("buys", "holdingId", holding_id)
     rebuild_stats()  # rare operation — full rescan is acceptable
 
-    user.remainingAmount = user.remainingAmount + value + est_charges["total"]
+    user.remainingAmount = user.remainingAmount + value + actual_charges
     save_user(user)
     return user, holdings
 
