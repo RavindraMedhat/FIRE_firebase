@@ -1566,11 +1566,30 @@ def _buy_more_form(row: pd.Series) -> None:
     c1, c2 = st.columns(2)
     default_price = float(row["cmp"]) if row["cmp"] else float(row["averagePrice"])
     suggested_qty = max(1, int(int(row["totalQuantity"]) * 0.10))
+    old_avg = float(row["averagePrice"])
+    old_qty = int(row["totalQuantity"])
+
+    # Read current widget values from session state to build live qty label
+    cur_price = float(st.session_state.get(f"bp_{row['id']}", default_price))
+    cur_qty = int(st.session_state.get(f"bq_{row['id']}", suggested_qty))
+    cur_kotak = float(st.session_state.get(f"bkt_{row['id']}", 0.0))
+    cur_eff = (cur_kotak / cur_qty) if cur_kotak > 0 and cur_qty > 0 else cur_price
+    qty_label = "Quantity"
+    if cur_eff > 0 and old_avg > 0:
+        _nav = (old_avg * old_qty + cur_eff * cur_qty) / (old_qty + cur_qty)
+        _cmp_pct = (_nav - cur_eff) / _nav * 100
+        if _cmp_pct > 0.005:
+            qty_label = f"Quantity  ·  *New avg ₹{_nav:.2f} — CMP {_cmp_pct:.2f}% below*"
+        elif _cmp_pct < -0.005:
+            qty_label = f"Quantity  ·  *New avg ₹{_nav:.2f} — CMP {abs(_cmp_pct):.2f}% above ⚠️*"
+        else:
+            qty_label = f"Quantity  ·  *New avg ₹{_nav:.2f} — same as CMP*"
+
     price = c1.number_input(
         "Buy price (per unit)", min_value=0.0, value=default_price, step=0.05, key=f"bp_{row['id']}"
     )
     qty = c2.number_input(
-        "Quantity", min_value=1, value=suggested_qty, step=1, key=f"bq_{row['id']}",
+        qty_label, min_value=1, value=suggested_qty, step=1, key=f"bq_{row['id']}",
         help=f"Default = 10% of your current holding ({int(row['totalQuantity'])} units) → {suggested_qty}",
     )
     kotak_total = st.number_input(
@@ -1588,19 +1607,6 @@ def _buy_more_form(row: pd.Series) -> None:
     ch = dm.compute_kotak_charges(value, str(row["etfType"]), side="buy")
     total_cost = value + ch["total"]
     st.caption(f"Remaining after: **{fmt_money(user.remainingAmount - total_cost)}**")
-
-    old_avg = float(row["averagePrice"])
-    old_qty = int(row["totalQuantity"])
-    if effective_price > 0 and old_avg > 0:
-        new_avg = (old_avg * old_qty + effective_price * qty) / (old_qty + qty)
-        avg_change_pct = (new_avg - old_avg) / old_avg * 100
-        cmp_vs_new_avg = (new_avg - effective_price) / new_avg * 100
-        if effective_price < old_avg:
-            st.caption(f"New avg ₹{new_avg:.2f} ({avg_change_pct:+.2f}%) — CMP is {cmp_vs_new_avg:.2f}% below new avg")
-        elif effective_price > old_avg:
-            st.caption(f"New avg ₹{new_avg:.2f} ({avg_change_pct:+.2f}%) — buying above avg ⚠️")
-        else:
-            st.caption(f"New avg ₹{new_avg:.2f} — same as current avg")
 
     _render_charge_breakdown(value, ch, side="buy")
 
