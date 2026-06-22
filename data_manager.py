@@ -86,6 +86,7 @@ EXCHANGE_TX_PCT = 0.00297
 SEBI_PCT = 0.0001
 STAMP_DUTY_PCT_BUY = 0.015
 GST_PCT = 18.0
+DP_CHARGE_AMOUNT = 18.88  # ₹16 + 18% GST, empirically confirmed from Kotak ledger
 
 
 def compute_kotak_charges(value: float, etf_type: str, side: str) -> dict:
@@ -1025,6 +1026,64 @@ def buy_etf(
     return user, holdings, charges
 
 
+def _dp_charge_date(sell_date: date) -> str:
+    """Return T+2 business date from sell_date (skips weekends)."""
+    d = sell_date
+    added = 0
+    while added < 2:
+        d += timedelta(days=1)
+        if d.weekday() < 5:  # Mon–Fri only
+            added += 1
+    return d.isoformat()
+
+
+def _auto_dp_charge(user: UserSettings, etf_name: str, etf_type: str) -> UserSettings:
+    """Auto-add DP charge after a Stocks sell (₹18.88 flat per ISIN per sell day).
+    Skips if a DP charge for this ISIN was already recorded today (same-ISIN same-day rule)."""
+    if etf_type != "Stocks":
+        return user
+    today = date.today()
+    charge_date = _dp_charge_date(today)
+    # Duplicate check: skip if DP charge for this ISIN + today's sell date already exists
+    existing = load_charges()
+    already = existing[
+        existing["chargeType"].isin(["DP Charge", "DP Charges"]) &
+        existing["description"].str.contains(etf_name, na=False) &
+        existing["description"].str.contains(today.isoformat(), na=False)
+    ]
+    if not already.empty:
+        return user
+    desc = f"DP Charges — {etf_name} sell {today.isoformat()}"
+    user.investment -= DP_CHARGE_AMOUNT
+    user.remainingAmount -= DP_CHARGE_AMOUNT
+    save_user(user)
+    save_charge("DP Charge", DP_CHARGE_AMOUNT, desc, charge_date)
+    return user
+
+
+def _reverse_auto_dp_charge(user: UserSettings, etf_name: str, etf_type: str, sell_date_iso: str) -> UserSettings:
+    """Find and delete the auto-added DP charge for this sell, if it exists.
+    Only acts on Stocks type. Matches by etf_name + sell date in description."""
+    if etf_type != "Stocks":
+        return user
+    sell_date_str = sell_date_iso[:10]  # take date portion only
+    charges = load_charges()
+    match = charges[
+        charges["chargeType"].isin(["DP Charge", "DP Charges"]) &
+        charges["description"].str.contains(etf_name, na=False) &
+        charges["description"].str.contains(sell_date_str, na=False)
+    ]
+    if match.empty:
+        return user
+    charge_id = str(match.iloc[0]["id"])
+    amount = float(match.iloc[0]["amount"])
+    _delete_document("charges", charge_id)
+    _update_stats({"chargesTotal": -amount})
+    user.investment += amount
+    user.remainingAmount += amount
+    return user
+
+
 def sell_holding(
     user: UserSettings,
     holding_id: str,
@@ -1127,6 +1186,7 @@ def sell_holding(
         - tax
     )
     save_user(user)
+    user = _auto_dp_charge(user, etf_name, etf_type)
 
     return user, holdings, pd.DataFrame([sell_row]), charges
 
@@ -1465,6 +1525,7 @@ def reverse_sell(user: UserSettings, sell_id: str) -> tuple[UserSettings, pd.Dat
         + dividend
         + tax
     )
+    user = _reverse_auto_dp_charge(user, etf_name, etf_type, str(row["sellDate"]))
     save_user(user)
 
     return user, holdings, sells
