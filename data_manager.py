@@ -965,6 +965,7 @@ def buy_etf(
     etf_type: str,
     price: float,
     quantity: int,
+    buy_date: str | None = None,
 ) -> tuple[UserSettings, pd.DataFrame, dict]:
     holdings = load_holdings()
     value = price * quantity
@@ -1007,11 +1008,16 @@ def buy_etf(
         "brokerageCharges": charges["brokerage"],
         "tax": charges["tax"],
         "totalCharges": charges["total"],
-        "buyDate": _now_iso(),
+        "buyDate": buy_date or _now_iso(),
     }
     _add_document("buys", buy_row)
 
-    epoch_days = (date.today() - date(1970, 1, 1)).days
+    _epoch = date(1970, 1, 1)
+    try:
+        _bd = pd.to_datetime(buy_date).date() if buy_date else date.today()
+    except Exception:
+        _bd = date.today()
+    epoch_days = (_bd - _epoch).days
     _update_stats({
         "buyCount": 1,
         "buyGross": value,
@@ -1037,23 +1043,23 @@ def _dp_charge_date(sell_date: date) -> str:
     return d.isoformat()
 
 
-def _auto_dp_charge(user: UserSettings, etf_name: str, etf_type: str) -> UserSettings:
+def _auto_dp_charge(user: UserSettings, etf_name: str, etf_type: str, ref_date: date | None = None) -> UserSettings:
     """Auto-add DP charge after a Stocks sell (₹18.88 flat per ISIN per sell day).
-    Skips if a DP charge for this ISIN was already recorded today (same-ISIN same-day rule)."""
+    Skips if a DP charge for this ISIN was already recorded for ref_date (same-ISIN same-day rule)."""
     if etf_type != "Stocks":
         return user
-    today = date.today()
-    charge_date = _dp_charge_date(today)
-    # Duplicate check: skip if DP charge for this ISIN + today's sell date already exists
+    sell_day = ref_date or date.today()
+    charge_date = _dp_charge_date(sell_day)
+    # Duplicate check: skip if DP charge for this ISIN + sell date already exists
     existing = load_charges()
     already = existing[
         existing["chargeType"].isin(["DP Charge", "DP Charges"]) &
         existing["description"].str.contains(etf_name, na=False) &
-        existing["description"].str.contains(today.isoformat(), na=False)
+        existing["description"].str.contains(sell_day.isoformat(), na=False)
     ]
     if not already.empty:
         return user
-    desc = f"DP Charges — {etf_name} sell {today.isoformat()}"
+    desc = f"DP Charges — {etf_name} sell {sell_day.isoformat()}"
     user.investment -= DP_CHARGE_AMOUNT
     user.remainingAmount -= DP_CHARGE_AMOUNT
     save_user(user)
@@ -1090,6 +1096,7 @@ def sell_holding(
     sell_price: float,
     quantity: int,
     dividend: float,
+    sell_date: str | None = None,
 ) -> tuple[UserSettings, pd.DataFrame, pd.DataFrame, dict]:
     holdings = load_holdings()
 
@@ -1116,7 +1123,11 @@ def sell_holding(
 
     # Compute exact weighted-avg holding days from buy lots for this holding
     epoch = date(1970, 1, 1)
-    sell_epoch = (date.today() - epoch).days
+    try:
+        _sd = pd.to_datetime(sell_date).date() if sell_date else date.today()
+    except Exception:
+        _sd = date.today()
+    sell_epoch = (_sd - epoch).days
     if "buys" in _DATA_CACHE and not _DATA_CACHE["buys"].empty:
         holding_lots = _DATA_CACHE["buys"][_DATA_CACHE["buys"]["holdingId"] == holding_id]
     else:
@@ -1147,7 +1158,7 @@ def sell_holding(
         "tax": tax,
         "dividendPaidToSelf": dividend,
         "lastPurchaseDate": last_purchase_date,
-        "sellDate": _now_iso(),
+        "sellDate": sell_date or _now_iso(),
         "holdingDays": holding_days,
     }
     _add_document("sells", sell_row)
@@ -1186,7 +1197,7 @@ def sell_holding(
         - tax
     )
     save_user(user)
-    user = _auto_dp_charge(user, etf_name, etf_type)
+    user = _auto_dp_charge(user, etf_name, etf_type, ref_date=_sd)
 
     return user, holdings, pd.DataFrame([sell_row]), charges
 

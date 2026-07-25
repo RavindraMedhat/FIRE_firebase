@@ -2678,72 +2678,183 @@ def page_settings() -> None:
     )
 
 
-@st.dialog("Edit Sell Price")
-def _edit_sell_dialog(sell_id: str, name: str, qty: int, old_price: float) -> None:
-    old_total = old_price * qty
-    st.markdown(f"**✏️ {name}** — {qty} units", unsafe_allow_html=True)
-    st.caption(f"Current recorded price: ₹{old_price:,.4f}/unit  |  Total: ₹{old_total:,.2f}")
-    st.markdown("---")
-    new_price = st.number_input(
-        "Sell price per unit (₹)",
-        min_value=0.0001,
-        value=round(old_price, 4),
-        step=0.0001,
-        format="%.4f",
-        help="Enter the exact per-unit sell price. The app will compute total and recalculate charges.",
+@st.dialog("Edit Sell")
+def _edit_sell_dialog(
+    sell_id: str, name: str, etf_type: str,
+    old_price: float, old_qty: int, old_date: str, avg_price: float,
+) -> None:
+    st.markdown(
+        f"**✏️ {name}** &nbsp;{badge(etf_type, 'equity')}",
+        unsafe_allow_html=True,
     )
-    new_total = new_price * qty
-    if abs(new_price - old_price) > 0.00001:
-        st.info(f"New total: ₹{new_total:,.2f}  |  Difference: ₹{new_total - old_total:+.2f}")
+    st.caption("Reverses the original sell and records a fresh one with the new values.")
+
+    try:
+        default_date = pd.to_datetime(old_date).date()
+    except Exception:
+        default_date = date.today()
+
     c1, c2 = st.columns(2)
-    if c1.button("💾 Save", type="primary", use_container_width=True, key="edit_sell_save"):
+    new_price = c1.number_input(
+        "Sell price (per unit) ₹", min_value=0.0001,
+        value=round(old_price, 4), step=0.05, format="%.4f", key="esell_price",
+    )
+    new_qty = c2.number_input("Quantity", min_value=1, value=old_qty, step=1, key="esell_qty")
+    new_date = st.date_input("Sell date", value=default_date, key="esell_date")
+
+    gross      = new_price * new_qty
+    ch         = dm.compute_kotak_charges(gross, etf_type, side="sell")
+    dividend   = gross * user.dividendPercentage / 100
+    total_fees = ch["brokerage"] + ch["tax"] + dividend
+    net        = gross - total_fees
+    realized   = (new_price - avg_price) * new_qty - total_fees
+
+    st.markdown("**Charges with updated values:**")
+    _render_charge_breakdown(gross, ch, side="sell", dividend=dividend, net=net, realized=realized)
+
+    old_gross = old_price * old_qty
+    old_ch    = dm.compute_kotak_charges(old_gross, etf_type, side="sell")
+    old_div   = old_gross * user.dividendPercentage / 100
+    old_net   = old_gross - old_ch["brokerage"] - old_ch["tax"] - old_div
+
+    price_changed = abs(new_price - old_price) > 0.00001
+    qty_changed   = new_qty != old_qty
+    date_changed  = new_date != default_date
+    changed       = price_changed or qty_changed or date_changed
+
+    if changed:
+        rows = []
+        if price_changed:
+            rows.append(f"| Price/unit | ₹{old_price:,.4f} | **₹{new_price:,.4f}** |")
+        if qty_changed:
+            rows.append(f"| Quantity | {old_qty} | **{new_qty}** |")
+        if date_changed:
+            rows.append(f"| Date | {default_date} | **{new_date}** |")
+        if abs(net - old_net) > 0.001:
+            rows.append(f"| Net proceeds | ₹{old_net:,.2f} | **₹{net:,.2f}** |")
+        st.markdown(
+            "**Changes from current record:**\n\n"
+            "| Field | Before | After |\n|---|---|---|\n" + "\n".join(rows)
+        )
+
+    bc1, bc2 = st.columns(2)
+    if bc1.button("💾 Save changes", type="primary", use_container_width=True,
+                  key="esell_save", disabled=not changed):
         _guard = f"_edit_sell_{sell_id}"
         if not st.session_state.get(_guard):
             st.session_state[_guard] = True
             try:
-                dm.update_sell_price(sell_id, new_total)
-                st.toast(f"✅ Updated to ₹{new_price:.4f}/unit", icon="✏️")
+                updated_user, updated_holdings, _ = dm.reverse_sell(st.session_state.user, sell_id)
+                h_match = updated_holdings[updated_holdings["etfName"] == name]
+                if h_match.empty:
+                    raise ValueError(f"Could not find restored holding for {name}.")
+                holding_id = str(h_match.iloc[0]["id"])
+                updated_user, _, _, _ = dm.sell_holding(
+                    user=updated_user,
+                    holding_id=holding_id,
+                    sell_price=new_price,
+                    quantity=new_qty,
+                    dividend=float(new_price * new_qty * user.dividendPercentage / 100),
+                    sell_date=new_date.isoformat(),
+                )
+                st.session_state.user = updated_user
+                st.session_state.suggestions = dm.generate_suggestions(
+                    updated_user, st.session_state.etfs, dm.load_holdings()
+                )
+                st.toast(f"✅ Sell updated — {name} {new_qty}@₹{new_price:.2f}", icon="✏️")
                 del st.session_state[_guard]
+                _clear_txn_cache()
                 st.rerun()
             except Exception as e:
                 del st.session_state[_guard]
                 st.error(str(e))
-    if c2.button("Cancel", use_container_width=True, key="edit_sell_cancel"):
+    if bc2.button("❌ Cancel", use_container_width=True, key="esell_cancel"):
         st.rerun()
 
 
-@st.dialog("Edit Buy Price")
-def _edit_buy_dialog(buy_id: str, name: str, qty: int, old_price: float) -> None:
-    old_total = old_price * qty
-    st.markdown(f"**✏️ {name}** — {qty} units", unsafe_allow_html=True)
-    st.caption(f"Current recorded price: ₹{old_price:,.4f}/unit  |  Total: ₹{old_total:,.2f}")
-    st.markdown("---")
-    new_price = st.number_input(
-        "Buy price per unit (₹)",
-        min_value=0.0001,
-        value=round(old_price, 4),
-        step=0.0001,
-        format="%.4f",
-        help="Enter the exact per-unit buy price. The app will compute total, recalculate charges, and adjust your balance.",
+@st.dialog("Edit Buy")
+def _edit_buy_dialog(
+    buy_id: str, name: str, etf_type: str,
+    old_price: float, old_qty: int, old_date: str,
+) -> None:
+    st.markdown(
+        f"**✏️ {name}** &nbsp;{badge(etf_type, 'equity')}",
+        unsafe_allow_html=True,
     )
-    new_total = new_price * qty
-    if abs(new_price - old_price) > 0.00001:
-        st.info(f"New total: ₹{new_total:,.2f}  |  Difference: ₹{new_total - old_total:+.2f}")
+    st.caption("Reverses the original buy and records a fresh one with the new values.")
+
+    try:
+        default_date = pd.to_datetime(old_date).date()
+    except Exception:
+        default_date = date.today()
+
     c1, c2 = st.columns(2)
-    if c1.button("💾 Save", type="primary", use_container_width=True, key="edit_buy_save"):
+    new_price = c1.number_input(
+        "Buy price (per unit) ₹", min_value=0.0001,
+        value=round(old_price, 4), step=0.05, format="%.4f", key="ebuy_price",
+    )
+    new_qty  = c2.number_input("Quantity", min_value=1, value=old_qty, step=1, key="ebuy_qty")
+    new_date = st.date_input("Buy date", value=default_date, key="ebuy_date")
+
+    value      = new_price * new_qty
+    ch         = dm.compute_kotak_charges(value, etf_type, side="buy")
+    total_cost = value + ch["total"]
+
+    st.markdown("**Charges with updated values:**")
+    _render_charge_breakdown(value, ch, side="buy")
+
+    old_value = old_price * old_qty
+    old_ch    = dm.compute_kotak_charges(old_value, etf_type, side="buy")
+    old_total = old_value + old_ch["total"]
+
+    price_changed = abs(new_price - old_price) > 0.00001
+    qty_changed   = new_qty != old_qty
+    date_changed  = new_date != default_date
+    changed       = price_changed or qty_changed or date_changed
+
+    if changed:
+        rows = []
+        if price_changed:
+            rows.append(f"| Price/unit | ₹{old_price:,.4f} | **₹{new_price:,.4f}** |")
+        if qty_changed:
+            rows.append(f"| Quantity | {old_qty} | **{new_qty}** |")
+        if date_changed:
+            rows.append(f"| Date | {default_date} | **{new_date}** |")
+        if abs(ch["total"] - old_ch["total"]) > 0.001:
+            rows.append(f"| Charges | ₹{old_ch['total']:,.2f} | **₹{ch['total']:,.2f}** |")
+        if abs(total_cost - old_total) > 0.001:
+            rows.append(f"| Total cost | ₹{old_total:,.2f} | **₹{total_cost:,.2f}** |")
+        st.markdown(
+            "**Changes from current record:**\n\n"
+            "| Field | Before | After |\n|---|---|---|\n" + "\n".join(rows)
+        )
+
+    bc1, bc2 = st.columns(2)
+    if bc1.button("💾 Save changes", type="primary", use_container_width=True,
+                  key="ebuy_save", disabled=not changed):
         _guard = f"_edit_buy_{buy_id}"
         if not st.session_state.get(_guard):
             st.session_state[_guard] = True
             try:
-                updated_user = dm.update_buy_price(st.session_state.user, buy_id, new_total)
+                updated_user, _, _ = dm.reverse_buy(st.session_state.user, buy_id)
+                updated_user, _, _ = dm.buy_etf(
+                    user=updated_user,
+                    etf_name=name, etf_type=etf_type,
+                    price=new_price, quantity=new_qty,
+                    buy_date=new_date.isoformat(),
+                )
                 st.session_state.user = updated_user
-                st.toast(f"✅ Updated to ₹{new_price:.4f}/unit", icon="✏️")
+                st.session_state.suggestions = dm.generate_suggestions(
+                    updated_user, st.session_state.etfs, dm.load_holdings()
+                )
+                st.toast(f"✅ Buy updated — {name} {new_qty}@₹{new_price:.2f}", icon="✏️")
                 del st.session_state[_guard]
+                _clear_txn_cache()
                 st.rerun()
             except Exception as e:
                 del st.session_state[_guard]
                 st.error(str(e))
-    if c2.button("Cancel", use_container_width=True, key="edit_buy_cancel"):
+    if bc2.button("❌ Cancel", use_container_width=True, key="ebuy_cancel"):
         st.rerun()
 
 
@@ -3135,25 +3246,30 @@ def _render_transaction_list(df: pd.DataFrame, kind: str, filtered: bool = False
 
             if kind == "sell":
                 ec1, ec2 = st.columns(2)
-                edit_clicked = ec1.button("✏️ Edit price", key=f"edit_{row['id']}", use_container_width=True)
+                edit_clicked = ec1.button("✏️ Edit", key=f"edit_{row['id']}", use_container_width=True)
                 rev_clicked  = ec2.button("↩️ Reverse", key=f"rev_{kind}_{row['id']}", use_container_width=True)
                 if edit_clicked:
                     _edit_sell_dialog(
                         sell_id=str(row["id"]),
                         name=str(row["etfName"]),
-                        qty=int(row["quantity"]),
+                        etf_type=str(row["etfType"]),
                         old_price=float(row["sellPrice"]),
+                        old_qty=int(row["quantity"]),
+                        old_date=str(row["sellDate"]),
+                        avg_price=float(row["averagePurchasePrice"]),
                     )
             else:
                 ec1, ec2 = st.columns(2)
-                edit_clicked = ec1.button("✏️ Edit price", key=f"edit_{row['id']}", use_container_width=True)
+                edit_clicked = ec1.button("✏️ Edit", key=f"edit_{row['id']}", use_container_width=True)
                 rev_clicked  = ec2.button("↩️ Reverse", key=f"rev_{kind}_{row['id']}", use_container_width=True)
                 if edit_clicked:
                     _edit_buy_dialog(
                         buy_id=str(row["id"]),
                         name=str(row["etfName"]),
-                        qty=int(row["quantity"]),
+                        etf_type=str(row["etfType"]),
                         old_price=float(row["price"]),
+                        old_qty=int(row["quantity"]),
+                        old_date=str(row["buyDate"]),
                     )
 
             if rev_clicked:

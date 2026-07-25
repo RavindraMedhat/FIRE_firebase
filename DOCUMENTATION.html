@@ -324,6 +324,7 @@
       <li><a href="#run">10. How to run</a></li>
       <li><a href="#extend">11. Extending</a></li>
       <li><a href="#limits">12. Simplifications</a></li>
+      <li><a href="#audit">13. Kotak Audit Tool</a></li>
     </ul>
   </aside>
 
@@ -947,6 +948,128 @@ streamlit run app.py</code></pre>
         <li><strong>No STT tracking on equity stock sells</strong> — the charge is computed and deducted from remaining amount, but not tracked in a separate line for tax filing purposes.</li>
         <li><strong>Holdings &gt; 20 warning</strong> is a soft UX nudge in Reports; not enforced.</li>
       </ol>
+    </section>
+
+    <!-- ══════════════════════════════════════════════════════════════════ -->
+    <section id="audit">
+      <h2><span class="emoji">📊</span> 13. Kotak Audit Tool</h2>
+      <p><code>kotak_audit.py</code> is a standalone script that cross-checks FIRE's Firebase data against Kotak's official Excel exports — no internet needed. It detects missing charges, mismatched trades, and balance gaps, and maintains a history of every audit run.</p>
+
+      <h3>Step 1 — Download Kotak reports</h3>
+      <p>Log in to <strong>Kotak Securities → Reports</strong> and download two files. Save both into the <code>reports/</code> folder inside the FIRE project directory.</p>
+      <div class="grid-2" style="gap:12px">
+        <div class="card">
+          <div style="font-size:1.1rem;font-weight:700;color:var(--accent);margin-bottom:6px">📒 Ledger Report</div>
+          <p style="margin:0;color:var(--muted);font-size:0.9rem">Menu: <strong>Reports → Ledger</strong><br>
+          Select FY 2026–27 (full year).<br>
+          File saves as: <code>Ledger_V4SF4_YYYYMMDD_YYYYMMDD.xlsx</code></p>
+        </div>
+        <div class="card">
+          <div style="font-size:1.1rem;font-weight:700;color:var(--blue);margin-bottom:6px">📋 Transaction Statement</div>
+          <p style="margin:0;color:var(--muted);font-size:0.9rem">Menu: <strong>Reports → Transaction Statement</strong><br>
+          Select the quarter to audit (e.g., Jul–Sep).<br>
+          File saves as: <code>Transaction_Statement_V4SF4_YYYYMMDD_YYYYMMDD.xlsx</code></p>
+        </div>
+      </div>
+
+      <h3>Step 2 — Run the audit</h3>
+      <div class="code-block"><pre>cd /Users/ravi/Desktop/FIRE
+python3 kotak_audit.py</pre></div>
+      <p>The script auto-detects the latest Ledger and Transaction Statement files in <code>reports/</code>. It connects to Firebase, runs 6 checks, saves results to <code>reports/audit_log.json</code>, generates an HTML report, and opens it in the browser.</p>
+      <p><strong>First run:</strong> checks demat charges from the beginning of history.<br>
+      <strong>Subsequent runs:</strong> only checks new demat entries since the last audit date (incremental).</p>
+
+      <h3>What the 6 checks do</h3>
+      <div class="grid-2" style="gap:12px">
+        <div class="card">
+          <strong style="color:var(--accent-2)">💰 Deposits</strong>
+          <p style="margin:6px 0 0;font-size:0.9rem;color:var(--muted)">Compares total deposits/withdrawals in Kotak ledger vs app's <code>totalDeposited</code>. Excludes cashflow entries that happened <em>after</em> the Kotak report's closing date.</p>
+        </div>
+        <div class="card">
+          <strong style="color:var(--accent-2)">🏦 Demat Charges</strong>
+          <p style="margin:6px 0 0;font-size:0.9rem;color:var(--muted)">Finds every AMC and DP charge in the ledger's Demat section and checks whether a matching entry exists in the app's charges collection. Flags anything missing.</p>
+        </div>
+        <div class="card">
+          <strong style="color:var(--accent-2)">📥 Buy Transactions</strong>
+          <p style="margin:6px 0 0;font-size:0.9rem;color:var(--muted)">Matches each Kotak buy by price + date (±5 days). Handles multi-lot: if you entered one Kotak trade as two app records, it sums quantities and still calls it matched.</p>
+        </div>
+        <div class="card">
+          <strong style="color:var(--accent-2)">📤 Sell Transactions</strong>
+          <p style="margin:6px 0 0;font-size:0.9rem;color:var(--muted)">Same as buys — matches Kotak sells to app sell records by price + date proximity. Reports missing or qty-mismatched sells.</p>
+        </div>
+        <div class="card">
+          <strong style="color:var(--accent-2)">⚖️ Balance vs Kotak</strong>
+          <p style="margin:6px 0 0;font-size:0.9rem;color:var(--muted)">Compares Kotak's ledger closing balance vs app's <code>remainingAmount</code>. Adjusts for post-report transactions so a fresh deposit or buy doesn't look like a gap. Gap ≤ ₹5 is a WARN (rounding); above ₹5 is a FAIL.</p>
+        </div>
+        <div class="card">
+          <strong style="color:var(--accent-2)">🔄 Internal Reconciliation</strong>
+          <p style="margin:6px 0 0;font-size:0.9rem;color:var(--muted)">Verifies the internal accounting identity: <code>remainingAmount + costBasis = totalDeposited + sellNetPL − charges</code>. A non-zero drift here means <code>rebuild_stats()</code> needs to be run.</p>
+        </div>
+      </div>
+
+      <h3>Reading the output</h3>
+      <p>Each check shows a badge: <strong style="color:#16a34a">PASS</strong> / <strong style="color:#d97706">WARN</strong> / <strong style="color:#dc2626">FAIL</strong>. Any issues are listed as Action Items with IDs like <code>1-1</code>, <code>1-2</code>.</p>
+      <p>The HTML report also shows all previous audits in a history dashboard — you can see date, status, and balance gap across every run.</p>
+
+      <h3>After fixing an issue</h3>
+      <p>Once you've fixed a flagged item in the app (e.g. added a missing DP charge), mark it done so it doesn't show as pending on the next report:</p>
+      <div class="code-block"><pre>python3 kotak_audit.py --mark-done 1-1 1-2</pre></div>
+
+      <h3>Other commands</h3>
+      <table style="width:100%;border-collapse:collapse;font-size:0.9rem;margin-top:8px">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border)">
+            <th style="text-align:left;padding:8px 0;color:var(--muted)">Command</th>
+            <th style="text-align:left;padding:8px 0;color:var(--muted)">What it does</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:8px 0"><code>python3 kotak_audit.py</code></td>
+            <td style="padding:8px 0">Auto-detect reports, run full audit, open HTML report</td>
+          </tr>
+          <tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:8px 0"><code>python3 kotak_audit.py --no-browser</code></td>
+            <td style="padding:8px 0">Same but don't open the browser (just save HTML)</td>
+          </tr>
+          <tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:8px 0"><code>python3 kotak_audit.py --history</code></td>
+            <td style="padding:8px 0">Print audit history table in terminal</td>
+          </tr>
+          <tr style="border-bottom:1px solid var(--border)">
+            <td style="padding:8px 0"><code>python3 kotak_audit.py --mark-done 1-1</code></td>
+            <td style="padding:8px 0">Mark action item 1-1 as done and regenerate HTML</td>
+          </tr>
+          <tr>
+            <td style="padding:8px 0"><code>python3 kotak_audit.py --ledger L.xlsx --txn T.xlsx</code></td>
+            <td style="padding:8px 0">Specify report files manually instead of auto-detecting</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Expected audit workflow (each quarter)</h3>
+      <ol>
+        <li>Download Ledger (full FY) + Transaction Statement (the quarter) from Kotak → save to <code>reports/</code></li>
+        <li>Run <code>python3 kotak_audit.py</code></li>
+        <li>Review the HTML report — fix any FAIL items in the app</li>
+        <li>Run <code>--mark-done</code> for each fixed item</li>
+        <li>Run the audit again — confirm all clear</li>
+      </ol>
+
+      <h3>Known acceptable gaps</h3>
+      <ul>
+        <li><strong>₹2–3 balance gap</strong> — cumulative rounding from trade charge formula (app and Kotak both round to 2 decimal places per component, and the tiny errors add up over hundreds of trades). Not a missing transaction.</li>
+        <li><strong>T+1 DP charges</strong> — Kotak posts DP charges the next business day after a Stocks sell. The date in the ledger may be 1 day after the sell date in the app. The audit allows ±3 days for demat charge matching.</li>
+      </ul>
+
+      <h3>Files written by the tool</h3>
+      <div class="tree">
+        <span class="dir">reports/</span><br>
+        &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">audit_log.json</span><span class="cmt">— full history: all audit results + action items + done status</span><br>
+        &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">audit_YYYY-MM-DD.html</span><span class="cmt">— latest HTML report (overwritten each run on same date)</span><br>
+        &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">Ledger_*.xlsx</span><span class="cmt">— downloaded from Kotak (not committed to git)</span><br>
+        &nbsp;&nbsp;&nbsp;&nbsp;<span class="file">Transaction_Statement_*.xlsx</span><span class="cmt">— downloaded from Kotak (not committed to git)</span>
+      </div>
     </section>
 
     <hr>
