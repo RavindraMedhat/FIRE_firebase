@@ -396,6 +396,108 @@ def check_balance(ledger, user, buys, sells, cashflow, charges):
         'note':        note,
     }
 
+def check_dates(txn, app_buys, app_sells):
+    """Verify trade dates in app match Kotak statement dates.
+    Uses same price-match logic as check_buys/check_sells.
+    Gap = 0 → OK.  Gap = 1 → WARN (timezone/late-night entry).  Gap ≥ 2 → FAIL."""
+    app_b = app_buys.copy()
+    app_b['_app_date'] = pd.to_datetime(app_b['buyDate'], format='mixed').dt.date
+    app_s = app_sells.copy()
+    app_s['_app_date'] = pd.to_datetime(app_s['sellDate'], format='mixed').dt.date
+
+    issues = []
+
+    # ── Buy dates ─────────────────────────────────────────────────────────────
+    kb = txn['buys'].copy()
+    kb['_date'] = kb['Trade Date'].apply(parse_ddmmyyyy)
+    groups = (kb.groupby(['Trade Date', 'Market Rate'], as_index=False)
+                .agg({'Quantity': 'sum', 'Security Name': 'first', '_date': 'first'}))
+
+    for _, kg in groups.iterrows():
+        qty   = int(kg['Quantity'])
+        price = float(kg['Market Rate'])
+        name  = str(kg['Security Name'])
+        kdate = kg['_date']
+        if kdate is None:
+            continue
+
+        pm = price_match_app(app_b, price, kdate, 'price', 'buyDate')
+        if pm.empty:
+            continue  # already flagged as missing in check_buys
+
+        exact = pm[pm['quantity'].astype(int) == qty]
+        match_rows = exact if not exact.empty else pm
+
+        for _, ar in match_rows.iterrows():
+            gap = abs((ar['_app_date'] - kdate).days)
+            if gap == 0:
+                continue
+            issues.append({
+                'side':       'Buy',
+                'security':   name,
+                'qty':        qty,
+                'price':      price,
+                'kotak_date': kdate.isoformat(),
+                'app_date':   ar['_app_date'].isoformat(),
+                'gap_days':   gap,
+                'app_id':     str(ar['id']),
+                'severity':   'warn' if gap == 1 else 'high',
+                'description': (
+                    f"Buy {name} {qty}@₹{price:.2f} — "
+                    f"Kotak: {kdate} | App: {ar['_app_date'].isoformat()} ({gap}d off)"
+                ),
+            })
+
+    # ── Sell dates ────────────────────────────────────────────────────────────
+    for _, ks in txn['sells'].iterrows():
+        qty   = int(ks['Quantity'])
+        price = float(ks['Market Rate'])
+        name  = str(ks['Security Name'])
+        kdate = parse_ddmmyyyy(ks['Trade Date'])
+        if kdate is None:
+            continue
+
+        pm = price_match_app(app_s, price, kdate, 'sellPrice', 'sellDate')
+        if pm.empty:
+            continue
+
+        exact = pm[pm['quantity'].astype(int) == qty]
+        match_rows = exact if not exact.empty else pm
+
+        for _, ar in match_rows.iterrows():
+            gap = abs((ar['_app_date'] - kdate).days)
+            if gap == 0:
+                continue
+            issues.append({
+                'side':       'Sell',
+                'security':   name,
+                'qty':        qty,
+                'price':      price,
+                'kotak_date': kdate.isoformat(),
+                'app_date':   ar['_app_date'].isoformat(),
+                'gap_days':   gap,
+                'app_id':     str(ar['id']),
+                'severity':   'warn' if gap == 1 else 'high',
+                'description': (
+                    f"Sell {name} {qty}@₹{price:.2f} — "
+                    f"Kotak: {kdate} | App: {ar['_app_date'].isoformat()} ({gap}d off)"
+                ),
+            })
+
+    highs = [i for i in issues if i['severity'] == 'high']
+    warns = [i for i in issues if i['severity'] == 'warn']
+    ok    = len(highs) == 0
+    parts = []
+    if highs: parts.append(f'{len(highs)} wrong date(s)')
+    if warns: parts.append(f'{len(warns)} off by 1 day')
+    return {
+        'pass':   ok,
+        'warn':   ok and len(warns) > 0,
+        'issues': issues,
+        'note':   ', '.join(parts) if parts else 'All dates match',
+    }
+
+
 def check_recon(user, holdings, stats):
     cost     = sum(float(h['averagePrice']) * int(h['totalQuantity'])
                    for _, h in holdings.iterrows())
@@ -436,6 +538,7 @@ def run_audit(ledger_path, txn_path, from_date, audit_num):
     demat = check_demat(ledger, charges, from_date)
     buy   = check_buys(txn, buys)
     sell  = check_sells(txn, sells)
+    dates = check_dates(txn, buys, sells)
     bal   = check_balance(ledger, user, buys, sells, cashflow, charges)
     recon = check_recon(user, holdings, stats)
 
@@ -476,6 +579,17 @@ def run_audit(ledger_path, txn_path, from_date, audit_num):
             'done_date':   None,
         }); idx += 1
 
+    for issue in dates['issues']:
+        if issue['severity'] == 'high':
+            actions.append({
+                'id':          f"{audit_num}-{idx}",
+                'type':        'wrong_date',
+                'severity':    'high',
+                'description': f"Fix date: {issue['description']}",
+                'status':      'pending',
+                'done_date':   None,
+            }); idx += 1
+
     if not recon['pass']:
         actions.append({
             'id':          f"{audit_num}-{idx}",
@@ -496,7 +610,7 @@ def run_audit(ledger_path, txn_path, from_date, audit_num):
             'done_date':   None,
         }); idx += 1
 
-    all_pass = dep['pass'] and demat['pass'] and buy['pass'] and sell['pass'] and recon['pass']
+    all_pass = dep['pass'] and demat['pass'] and buy['pass'] and sell['pass'] and dates['pass'] and recon['pass']
     status   = 'clean' if (all_pass and not actions) else 'issues_found'
 
     return {
@@ -516,6 +630,7 @@ def run_audit(ledger_path, txn_path, from_date, audit_num):
             'demat':    demat,
             'buys':     buy,
             'sells':    sell,
+            'dates':    dates,
             'balance':  bal,
             'recon':    recon,
         },
@@ -702,6 +817,34 @@ def generate_html(history):
         header = '<table><tr><th>Security</th><th>Date</th><th class="num">Price</th><th class="num">Qty</th><th>Status</th></tr>'
         return match_line + header + rows + '</table>'
 
+    def dates_detail(s):
+        c = s['sections']['dates']
+        if not c['issues']:
+            return '<p style="color:#4ade80;font-size:13px">✓ All trade dates match Kotak statement</p>'
+        rows = ''
+        for i in c['issues']:
+            color = '#fbbf24' if i['severity'] == 'warn' else '#f87171'
+            icon  = '⚠' if i['severity'] == 'warn' else '✗'
+            rows += (
+                f'<tr style="color:{color}">'
+                f'<td>{icon} {i["side"]}</td>'
+                f'<td>{i["security"][:35]}</td>'
+                f'<td class="num">{i["qty"]}</td>'
+                f'<td class="num">₹{i["price"]:.2f}</td>'
+                f'<td>{i["kotak_date"]}</td>'
+                f'<td>{i["app_date"]}</td>'
+                f'<td class="num">{i["gap_days"]}d</td>'
+                f'</tr>'
+            )
+        return (
+            '<table>'
+            '<tr><th>Side</th><th>Security</th><th class="num">Qty</th>'
+            '<th class="num">Price</th><th>Kotak date</th><th>App date</th><th class="num">Gap</th></tr>'
+            + rows + '</table>'
+            '<p style="color:#64748b;font-size:12px;margin-top:6px">'
+            '⚠ = 1 day off (warn) &nbsp;·&nbsp; ✗ = 2+ days wrong (fix needed)</p>'
+        )
+
     def balance_detail(s):
         c = s['sections']['balance']
         gap_color = '#4ade80' if c['pass'] else '#f87171'
@@ -789,6 +932,7 @@ def generate_html(history):
             section_html('🏦', 'Demat Charges', current['sections']['demat'], demat_detail(current)) +
             section_html('📥', 'Buy Transactions', current['sections']['buys'], trades_detail(current, 'buys', 'Market Rate', 'Quantity')) +
             section_html('📤', 'Sell Transactions', current['sections']['sells'], trades_detail(current, 'sells', 'Market Rate', 'Quantity')) +
+            section_html('📅', 'Trade Dates', current['sections']['dates'], dates_detail(current)) +
             section_html('⚖️', 'Balance vs Kotak', current['sections']['balance'], balance_detail(current)) +
             section_html('🔄', 'Internal Reconciliation', current['sections']['recon'], recon_detail(current)) +
             '<div class="section"><div class="section-header"><span class="section-title">📋 Action Items</span></div>' +
@@ -929,12 +1073,14 @@ def main():
     pending  = [a for a in actions if a['status'] == 'pending']
     sections = result['sections']
 
-    print(f"{'✅' if sections['deposits']['pass'] else '❌'} Deposits:        {sections['deposits']['note']}")
-    print(f"{'✅' if sections['demat']['pass'] else '❌'} Demat charges:   {sections['demat']['note']}")
-    print(f"{'✅' if sections['buys']['pass'] else '❌'} Buys:            {sections['buys']['note']}")
-    print(f"{'✅' if sections['sells']['pass'] else '❌'} Sells:           {sections['sells']['note']}")
-    print(f"{'⚠️' if sections['balance']['warn'] else ('✅' if sections['balance']['pass'] else '❌')} Balance:         {sections['balance']['note']}")
-    print(f"{'✅' if sections['recon']['pass'] else '❌'} Reconciliation:  {sections['recon']['note']}")
+    def _icon(s): return '⚠️ ' if s.get('warn') else ('✅' if s['pass'] else '❌')
+    print(f"{_icon(sections['deposits'])} Deposits:        {sections['deposits']['note']}")
+    print(f"{_icon(sections['demat'])} Demat charges:   {sections['demat']['note']}")
+    print(f"{_icon(sections['buys'])} Buys:            {sections['buys']['note']}")
+    print(f"{_icon(sections['sells'])} Sells:           {sections['sells']['note']}")
+    print(f"{_icon(sections['dates'])} Trade dates:     {sections['dates']['note']}")
+    print(f"{_icon(sections['balance'])} Balance:         {sections['balance']['note']}")
+    print(f"{_icon(sections['recon'])} Reconciliation:  {sections['recon']['note']}")
 
     if pending:
         print(f"\n⚠️  {len(pending)} action item(s) need attention:")
