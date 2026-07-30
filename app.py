@@ -1084,7 +1084,6 @@ def _render_holding_cards(
             show_hist = btn_cols[2].button(
                 "📜 History", key=f"bhist_{row['id']}", use_container_width=True,
             )
-
             active_key = f"active_{row['id']}"
             if show_sell:
                 st.session_state[active_key] = "sell"

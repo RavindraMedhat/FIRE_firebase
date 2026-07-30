@@ -428,10 +428,13 @@ def check_dates(txn, app_buys, app_sells):
         exact = pm[pm['quantity'].astype(int) == qty]
         match_rows = exact if not exact.empty else pm
 
-        for _, ar in match_rows.iterrows():
-            gap = abs((ar['_app_date'] - kdate).days)
-            if gap == 0:
-                continue
+        # Pick the single closest-date match to avoid false positives when multiple
+        # app records share the same price across consecutive days.
+        match_rows = match_rows.copy()
+        match_rows['_gap'] = match_rows['_app_date'].apply(lambda d: abs((d - kdate).days))
+        ar = match_rows.loc[match_rows['_gap'].idxmin()]
+        gap = int(ar['_gap'])
+        if gap > 0:
             issues.append({
                 'side':       'Buy',
                 'security':   name,
@@ -464,10 +467,11 @@ def check_dates(txn, app_buys, app_sells):
         exact = pm[pm['quantity'].astype(int) == qty]
         match_rows = exact if not exact.empty else pm
 
-        for _, ar in match_rows.iterrows():
-            gap = abs((ar['_app_date'] - kdate).days)
-            if gap == 0:
-                continue
+        match_rows = match_rows.copy()
+        match_rows['_gap'] = match_rows['_app_date'].apply(lambda d: abs((d - kdate).days))
+        ar = match_rows.loc[match_rows['_gap'].idxmin()]
+        gap = int(ar['_gap'])
+        if gap > 0:
             issues.append({
                 'side':       'Sell',
                 'security':   name,
