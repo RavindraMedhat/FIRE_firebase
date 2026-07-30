@@ -2606,6 +2606,53 @@ def page_settings() -> None:
                     st.rerun()
 
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+    section("Order Automation")
+    with st.container(border=True):
+        st.markdown("**📤 Export orders for Playwright**")
+        st.caption(
+            "Writes `kotak_orders.json` in the FIRE folder. "
+            "Then run `python kotak_order.py` in terminal to place them via Playwright."
+        )
+        if st.button("📤 Export orders", type="secondary", key="export_orders_btn"):
+            import math, json
+            from pathlib import Path
+            _holdings = dm.load_holdings()
+            _etfs     = st.session_state.get("etfs", pd.DataFrame())
+            _orders   = []
+            for _, h in _holdings.iterrows():
+                _name = str(h["etfName"])
+                _qty  = int(h["totalQuantity"])
+                _avg  = float(h["averagePrice"])
+                _cmp  = 0.0
+                if not _etfs.empty:
+                    _row = _etfs[_etfs["name"] == _name]
+                    if not _row.empty:
+                        _cmp = float(_row.iloc[0].get("cmp", 0) or 0)
+                if _cmp <= 0:
+                    continue
+                _pnl_pct = (_cmp - _avg) / _avg * 100
+                if _pnl_pct >= 0:
+                    _price = round(_avg * (1 + user.sellProfitTarget / 100), 2)
+                    _order_qty = _qty
+                    _action = "SELL"
+                else:
+                    _price = round(_avg * (1 - user.buyInDipThreshold / 100), 2)
+                    _order_qty = math.ceil(_qty * 0.1)
+                    _action = "BUY"
+                _orders.append({
+                    "action": _action,
+                    "name":   _name,
+                    "qty":    _order_qty,
+                    "price":  _price,
+                })
+            _orders.sort(key=lambda o: (0 if o["action"] == "SELL" else 1))
+            _out = Path(__file__).parent / "kotak_orders.json"
+            _out.write_text(json.dumps(_orders, indent=2, ensure_ascii=False))
+            st.success(f"✅ {len(_orders)} orders written to `kotak_orders.json`")
+            st.caption("Now run: `python kotak_order.py` in your terminal")
+
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
     section("Maintenance")
     with st.container(border=True):
         st.markdown("**🔄 Rebuild summary stats**")
