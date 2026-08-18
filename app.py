@@ -640,46 +640,40 @@ def _format_last_fetch() -> str:
 with st.sidebar:
     st.markdown('<p class="app-title">🔥 FIRE</p>', unsafe_allow_html=True)
     st.markdown('<p class="app-subtitle">Financial Independence Tracker</p>', unsafe_allow_html=True)
+    if user.userName:
+        _sb_initials = "".join(w[0].upper() for w in user.userName.split() if w)[:2]
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;margin-top:6px;'
+            f'padding:8px 10px;background:rgba(255,255,255,0.05);border-radius:10px">'
+            f'  <div style="width:32px;height:32px;border-radius:50%;flex-shrink:0;'
+            f'background:linear-gradient(135deg,#6366f1,#8b5cf6);display:flex;'
+            f'align-items:center;justify-content:center;font-size:0.82rem;font-weight:700;color:#fff">'
+            f'    {_sb_initials}'
+            f'  </div>'
+            f'  <div style="font-size:0.84rem;color:#FAFAFA;font-weight:500;'
+            f'overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'
+            f'    {user.userName}'
+            f'  </div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
     st.divider()
 
     page = st.radio(
         "Navigate",
         ["🏠 Home", "💡 Suggestions", "📋 Listed ETFs", "🔄 Transactions", "📜 Sell History", "📊 Reports", "⚙️ Settings", "ℹ️ Info"],
         label_visibility="collapsed",
-    )
-
-    st.divider()
-
-    if st.button("🔄 Refresh ETFs", use_container_width=True):
-        refresh_etfs()
-        st.rerun()
-
-    st.markdown(
-        f'<div style="margin-top:8px;color:#8B93A7;font-size:0.78rem;">'
-        f'Last fetched <b style="color:#FAFAFA;">{_format_last_fetch()}</b><br>'
-        f'{len(etfs)} ETFs cached'
-        f'</div>',
-        unsafe_allow_html=True,
+        key="nav_page",
     )
 
     st.divider()
 
     # ── Quick stats ───────────────────────────────────────────────────────
-    _sb_holdings    = dm.load_holdings()
-    _sb_cost        = dm.holdings_total_cost(_sb_holdings)
-
-    cash            = user.remainingAmount
-    deposited       = user.totalDeposited           # money physically transferred in
-    eff_budget      = user.investment               # deposited + realized P&L
-    realized_pl     = eff_budget - deposited        # net profit/loss added so far
-    cash_pct        = (cash / eff_budget * 100) if eff_budget else 0
-    dep_pct         = 100 - cash_pct
-
-    # verification: cash + cost_basis should equal effective budget
-    verified        = abs((cash + _sb_cost) - eff_budget) < 1.0
-    ver_color       = "#2ecc71" if verified else "#e74c3c"
-    ver_icon        = "✓" if verified else "✗"
-    ver_diff        = (cash + _sb_cost) - eff_budget
+    cash        = user.remainingAmount
+    deposited   = user.totalDeposited
+    eff_budget  = user.investment
+    realized_pl = eff_budget - deposited
+    cash_pct    = (cash / eff_budget * 100) if eff_budget else 0
 
     def _tip(text):
         return f'<span title="{text}" style="cursor:help;opacity:0.35;font-size:0.62rem;margin-left:3px">ⓘ</span>'
@@ -701,33 +695,36 @@ with st.sidebar:
             f'</div>'
         )
 
-    pl_color = "#2ecc71" if realized_pl >= 0 else "#e74c3c"
-    pl_sign  = "+" if realized_pl >= 0 else ""
+    pl_color   = "#2ecc71" if realized_pl >= 0 else "#e74c3c"
+    pl_sign    = "+" if realized_pl >= 0 else ""
     cash_color = "#2ecc71" if cash_pct > 10 else "#e74c3c"
 
     st.markdown(
-        f'<div style="background:rgba(255,255,255,0.04);border-radius:10px;padding:12px 14px 6px 14px;margin-top:4px">'
+        f'<div style="background:rgba(255,255,255,0.04);border-radius:10px;padding:12px 14px 6px 14px">'
         f'<div style="font-size:0.65rem;font-weight:700;letter-spacing:.1em;opacity:0.35;margin-bottom:12px">QUICK STATS</div>'
-
-        + _stat("You deposited",
-                fmt_money(deposited, 0),
+        + _stat("Deposited", fmt_money(deposited, 0),
                 tip="Money you actually transferred from your bank into Kotak.")
-
-        + _stat("After profit / loss",
-                fmt_money(eff_budget, 0),
-                vc=pl_color,
-                badge=f"{pl_sign}{fmt_money(realized_pl, 0)}",
-                badge_color=pl_color,
+        + _stat("After P&L", fmt_money(eff_budget, 0), vc=pl_color,
+                badge=f"{pl_sign}{fmt_money(realized_pl, 0)}", badge_color=pl_color,
                 tip="Deposited + net realized P&L from all sells.")
-
         + f'<div style="border-top:1px solid rgba(255,255,255,0.07);margin:4px 0 10px"></div>'
-
-        + _stat("Cash in hand",
-                fmt_money(cash, 0),
-                vc=cash_color,
+        + _stat("Cash in hand", fmt_money(cash, 0), vc=cash_color,
                 tip=f"Liquid cash available ({cash_pct:.1f}% of budget). Matches your Kotak balance.")
-
         + f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.divider()
+
+    # ── ETF refresh ───────────────────────────────────────────────────────
+    if st.button("🔄 Refresh ETFs", use_container_width=True):
+        refresh_etfs()
+        st.rerun()
+    st.markdown(
+        f'<div style="margin-top:8px;color:#8B93A7;font-size:0.78rem;">'
+        f'Last fetched <b style="color:#FAFAFA;">{_format_last_fetch()}</b><br>'
+        f'{len(etfs)} ETFs cached'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
@@ -2329,16 +2326,10 @@ def page_settings() -> None:
 
         section("Capital")
         c1, c2 = st.columns(2)
-        investment = c1.number_input(
-            "Total investment", min_value=0.0, value=float(user.investment), step=100.0
-        )
-        implied_remaining = investment - (user.investment - user.remainingAmount)
-        remaining = c2.number_input(
-            "Remaining amount (auto)",
-            value=float(implied_remaining),
-            step=100.0,
-            help="Computed as investment − deployed capital. Adjust only if needed.",
-        )
+        c1.number_input("Total investment", value=float(user.investment), step=100.0, disabled=True)
+        c2.number_input("Remaining amount (auto)", value=float(user.remainingAmount), step=100.0, disabled=True,
+                        help="Managed automatically by Deposit / Withdraw / Buy / Sell / Charges.")
+        st.caption("💡 Use Deposit / Withdraw / Add Charge below to change these.")
 
         section("Personal")
         dividend_pct = st.number_input(
@@ -2372,13 +2363,10 @@ def page_settings() -> None:
         st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
         if st.form_submit_button("💾 Save", use_container_width=True, type="primary"):
-            if remaining < 0:
-                st.error("Remaining amount cannot be negative.")
-                return
             u = dm.UserSettings(
                 userName=name,
-                investment=float(investment),
-                remainingAmount=float(remaining),
+                investment=float(user.investment),
+                remainingAmount=float(user.remainingAmount),
                 taxPercentage=0.0,
                 brokeragePercentage=0.0,
                 dividendPercentage=float(dividend_pct),
