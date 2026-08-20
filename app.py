@@ -1833,6 +1833,21 @@ def page_listed_etfs() -> None:
         },
     )
 
+    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+    etf_options = view["name"].tolist()
+    hc1, hc2 = st.columns([5, 1])
+    sel_etf = hc1.selectbox(
+        "View history",
+        etf_options,
+        index=None,
+        placeholder="Select an ETF to view your transaction history…",
+        label_visibility="collapsed",
+    )
+    hc1.caption("Select an ETF → view your full buy/sell history for it")
+    if hc2.button("📜 History", use_container_width=True, disabled=sel_etf is None):
+        row = view[view["name"] == sel_etf].iloc[0]
+        _history_dialog(str(row["name"]), str(row["type"]))
+
 
 _SH_BATCH = 50
 
