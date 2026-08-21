@@ -1081,11 +1081,13 @@ def _render_holding_cards(
             show_hist = btn_cols[2].button(
                 "📜 History", key=f"bhist_{row['id']}", use_container_width=True,
             )
+            # Clicking the same button again collapses the form back down.
             active_key = f"active_{row['id']}"
+            current_active = st.session_state.get(active_key)
             if show_sell:
-                st.session_state[active_key] = "sell"
+                st.session_state[active_key] = None if current_active == "sell" else "sell"
             elif show_buy:
-                st.session_state[active_key] = "buy"
+                st.session_state[active_key] = None if current_active == "buy" else "buy"
 
             if show_hist:
                 _history_dialog(str(row["etfName"]), str(row["etfType"]))
@@ -1158,7 +1160,8 @@ def _sell_form(row: pd.Series) -> None:
 
     _render_charge_breakdown(gross, ch, side="sell", dividend=dividend, net=net, realized=realized)
 
-    if st.button("✅ Review & Sell", key=f"sbtn_{row['id']}", use_container_width=True, type="primary"):
+    fc1, fc2 = st.columns(2)
+    if fc1.button("✅ Review & Sell", key=f"sbtn_{row['id']}", use_container_width=True, type="primary"):
         _sell_dialog(
             holding_id=str(row["id"]),
             name=str(row["etfName"]),
@@ -1167,6 +1170,9 @@ def _sell_form(row: pd.Series) -> None:
             qty=int(qty),
             avg_price=float(row["averagePrice"]),
         )
+    if fc2.button("✖ Close", key=f"sclose_{row['id']}", use_container_width=True):
+        st.session_state[f"active_{row['id']}"] = None
+        st.rerun()
 
 
 def _clear_txn_cache() -> None:
@@ -1606,13 +1612,17 @@ def _buy_more_form(row: pd.Series) -> None:
 
     _render_charge_breakdown(value, ch, side="buy")
 
-    if st.button("✅ Review & Buy", key=f"bbtn_{row['id']}", use_container_width=True, type="primary"):
+    fc1, fc2 = st.columns(2)
+    if fc1.button("✅ Review & Buy", key=f"bbtn_{row['id']}", use_container_width=True, type="primary"):
         _buy_dialog(
             name=str(row["etfName"]),
             etf_type=str(row["etfType"]),
             price=float(effective_price),
             qty=int(qty),
         )
+    if fc2.button("✖ Close", key=f"bclose_{row['id']}", use_container_width=True):
+        st.session_state[f"active_{row['id']}"] = None
+        st.rerun()
 
 
 def page_suggestions() -> None:
