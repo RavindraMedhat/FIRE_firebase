@@ -1983,7 +1983,7 @@ def page_sell_history() -> None:
     st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
     # ── Cards ────────────────────────────────────────────────────────────────
-    view["_dt"] = pd.to_datetime(view["sellDate"], errors="coerce")
+    view["_dt"] = pd.to_datetime(view["sellDate"], format="mixed", errors="coerce")
     view = view.sort_values("_dt", ascending=False, na_position="last").reset_index(drop=True)
     view["_label"] = view["_dt"].apply(
         lambda dt: _chat_date_label(dt) if pd.notna(dt) else "Unknown date"
@@ -3063,7 +3063,7 @@ def page_transactions() -> None:
             st.info("No charge records found." if date_filter_active else "No charge records yet. Demat AMC will appear here once auto-deducted.")
         else:
             ch = charges.copy()
-            ch["_dt"] = pd.to_datetime(ch["chargeDate"], errors="coerce")
+            ch["_dt"] = pd.to_datetime(ch["chargeDate"], format="mixed", errors="coerce")
             ch = ch.sort_values("_dt", ascending=False).reset_index(drop=True)
             loaded_ch  = len(ch)
             total_ch   = st.session_state.get("txn_total_charge", loaded_ch)
@@ -3127,7 +3127,7 @@ def page_transactions() -> None:
             st.info("No records found." if date_filter_active else "No deposit or withdrawal history yet.")
         else:
             cf = cf.copy()
-            cf["_dt"] = pd.to_datetime(cf["date"], errors="coerce")
+            cf["_dt"] = pd.to_datetime(cf["date"], format="mixed", errors="coerce")
             cf = cf.sort_values("_dt", ascending=False).reset_index(drop=True)
             loaded_cf   = len(cf)
             total_cf    = st.session_state.get("txn_total_cash", loaded_cf)
@@ -3226,7 +3226,7 @@ _TXN_BATCH = 20
 def _render_transaction_list(df: pd.DataFrame, kind: str, filtered: bool = False) -> None:
     date_col = "buyDate" if kind == "buy" else "sellDate"
     df = df.copy()
-    df["_dt"] = pd.to_datetime(df[date_col], errors="coerce")
+    df["_dt"] = pd.to_datetime(df[date_col], format="mixed", errors="coerce")
     df = df.sort_values("_dt", ascending=False, na_position="last").reset_index(drop=True)
     df["_label"] = df["_dt"].apply(
         lambda dt: _chat_date_label(dt) if pd.notna(dt) else "Unknown date"
